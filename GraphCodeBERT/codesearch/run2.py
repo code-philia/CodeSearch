@@ -38,7 +38,6 @@ from torch.optim.lr_scheduler import StepLR, ExponentialLR, LambdaLR
 from collections import defaultdict
 import torch.nn.functional as F
 
-
 logger = logging.getLogger(__name__)
 
 from tqdm import tqdm, trange
@@ -51,7 +50,6 @@ from parser import (remove_comments_and_docstrings,
                    index_to_code_token,
                    tree_to_variable_index)
 from tree_sitter import Language, Parser
-import gc
 dfg_function={
     'python':DFG_python,
     'java':DFG_java,
@@ -569,1034 +567,128 @@ def save_train_features(args, model, tokenizer,pool):
     logger.info("  Total train batch size  = %d", args.train_batch_size)
     logger.info("  Total optimization steps = %d", len(train_dataloader)*args.num_train_epochs)
     
-    epochs_to_load = [1, 25, 50]  # Load models from these epochs
-    epochs_to_save = [1, 2, 3]   # Save features to these epochs
-    
-    for idx, load_epoch in enumerate(epochs_to_load):
-        save_epoch = epochs_to_save[idx]
-        
-        output_dir = os.path.join(args.output_dir, 'Epoch_{}'.format(load_epoch))
-        ckpt_output_path = os.path.join(output_dir, 'subject_model_only_aa_labeled_3.pth')
-
-        model.load_state_dict(torch.load(ckpt_output_path),strict=False) 
-        model.to(args.device)
-        model.eval()        
-        nl_token = []
-        nl_tokens = []
-        all_nl_cls_attention = []
-        code_token = []
-        code_tokens = []
-        all_code_cls_attention = []
-        tokenized_id = []
-
-        # Load sample indices from file
-        input_path = "/home/yiming/cophi/projects/fork/CodeBERT/GraphCodeBERT/codesearch/auto_labelling/sorted_labelling_sample_api_student_conf_sorted.jsonl"
-        sample_indices = []
-
-        with open(input_path, 'r', encoding='utf-8') as file:
-            for line in file:
-                line = line.strip().rstrip(',')
-                json_obj = json.loads(line)
-                sample_indices.append(json_obj['idx'])
-
-        for step,batch in enumerate(train_dataloader):
-            batch_start_idx = step * args.train_batch_size
-            batch_end_idx = batch_start_idx + args.train_batch_size
-
-            # Check if current batch contains any samples we want
-            batch_indices = list(range(batch_start_idx, batch_end_idx))
-            if not any(idx in sample_indices for idx in batch_indices):
-                continue
-
-            # Create mask for samples we want to keep
-            batch_mask = torch.tensor([idx in sample_indices for idx in batch_indices]).to(args.device)
-
-            nl_inputs = batch[3].to(args.device)
-            nl_outputs = model(nl_inputs=nl_inputs)
-
-            code_inputs = batch[0].to(args.device)  
-            attn_mask = batch[1].to(args.device)
-            position_idx = batch[2].to(args.device)
-            code_outputs = model(code_inputs=code_inputs,attn_mask=attn_mask,position_idx=position_idx)
-
-            # Only store features for samples in our index list
-            nl_vec = nl_outputs[1][batch_mask]
-            nl_token.append(nl_vec.cpu().detach().numpy())
-
-            nl_attentions = nl_outputs[3]
-            nl_last_layer_attention = nl_attentions[-1]
-            nl_cls_attention = nl_last_layer_attention[:, :, 0, :].mean(dim=1)[batch_mask]
-            all_nl_cls_attention.append(nl_cls_attention.cpu().detach().numpy())
-
-            code_vec = code_outputs[1][batch_mask]
-            code_token.append(code_vec.cpu().detach().numpy())
-
-            code_attentions = code_outputs[3]
-            code_last_layer_attention = code_attentions[-1]
-            code_cls_attention = code_last_layer_attention[:, :, 0, :].mean(dim=1)[batch_mask]
-            all_code_cls_attention.append(code_cls_attention.cpu().detach().numpy())
-
-            nl_last_hidden_state = nl_outputs[2][-2]
-            nl_final_hidden_state = nl_outputs[2][-1][:,0,:]
-            filtered_nl_hidden_states = nl_last_hidden_state[batch_mask]
-            filtered_nl_final_states = nl_final_hidden_state[batch_mask]
-            filtered_nl_hidden_states[:,0,:] = filtered_nl_final_states
-            nl_tokens.append(filtered_nl_hidden_states.cpu().detach().numpy())
-
-            code_last_hidden_state = code_outputs[2][-2]
-            code_final_hidden_state = code_outputs[2][-1][:,0,:]
-            filtered_code_hidden_states = code_last_hidden_state[batch_mask]
-            filtered_code_final_states = code_final_hidden_state[batch_mask]
-            filtered_code_hidden_states[:,0,:] = filtered_code_final_states
-            code_tokens.append(filtered_code_hidden_states.cpu().detach().numpy())
-
-        # Save features for current epoch
-        output_dir = os.path.join("/home/yiming/cophi/training_dynamic/features/only_aa_labeled_3", f'Epoch_{save_epoch}')
-        os.makedirs(output_dir, exist_ok=True)
-
-        nl_token = np.concatenate(nl_token, 0)
-        nl_tokens = np.concatenate(nl_tokens, 0)
-        all_nl_cls_attention = np.concatenate(all_nl_cls_attention, 0)
-        
-        print(f"Epoch {load_epoch} -> {save_epoch}: ", nl_token.shape)
-        nl_token_output_path = os.path.join(output_dir, 'train_nl_cls_token_aa.npy')
-        np.save(nl_token_output_path, nl_token)
-
-        print(all_nl_cls_attention.shape)
-        nl_attention_output_path = os.path.join(output_dir, 'train_nl_attention_aa.npy')
-        np.save(nl_attention_output_path, all_nl_cls_attention)
-
-        print(nl_tokens.shape)
-        nl_tokens_output_path = os.path.join(output_dir, 'train_nl_tokens_aa.npy')
-        np.save(nl_tokens_output_path, nl_tokens)
-
-        code_token = np.concatenate(code_token, 0)
-        code_tokens = np.concatenate(code_tokens, 0)
-        all_code_cls_attention = np.concatenate(all_code_cls_attention, 0)
-        
-        print(code_token.shape)
-        code_token_output_path = os.path.join(output_dir, 'train_code_cls_token_aa.npy')
-        np.save(code_token_output_path, code_token)
-
-        print(all_code_cls_attention.shape)
-        code_attention_output_path = os.path.join(output_dir, 'train_code_attention_aa.npy')
-        np.save(code_attention_output_path, all_code_cls_attention)
-
-        print(code_tokens.shape)
-        code_token_output_path = os.path.join(output_dir, 'train_code_tokens_aa.npy')
-        np.save(code_token_output_path, code_tokens)
-
-def save_one_sample_features(args, model, tokenizer, pool):
-    """ Save features for a single specified sample across all epochs """
-    # Get training dataset
-    train_dataset = TextDataset(tokenizer, args, args.train_data_file, pool)
-    train_sampler = SequentialSampler(train_dataset)
-    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=4)
-    
-    # Multi-gpu setup
-    if args.n_gpu > 1:
-        model = torch.nn.DataParallel(model)
-
-    # Load target sample index
-    target_idx = 5373  # Specify which sample to track
-    batch_size = args.train_batch_size
-    target_batch = target_idx // batch_size
-    target_idx_in_batch = target_idx % batch_size
-
-    # Track features across epochs 1-50
-    for epoch in range(1, 51):
-        # Load model checkpoint for current epoch
-        output_dir = os.path.join(args.output_dir, f'Epoch_{epoch}')
-        ckpt_output_path = os.path.join(output_dir, 'subject_model_only_aa_labeled_3.pth')
-        
-        # Create output directory for features
-        features_output_dir = os.path.join("/home/yiming/cophi/training_dynamic/features/only_aa_labeled_multi_epochs", f'Epoch_{epoch}')
-        os.makedirs(features_output_dir, exist_ok=True)
-        
-        # Load model state
-        model.load_state_dict(torch.load(ckpt_output_path), strict=False)
-        model.to(args.device)
-        model.eval()
-
-        # Process only the target batch
-        with torch.no_grad():
-            for step, batch in enumerate(train_dataloader):
-                if step != target_batch:
-                    continue
-                    
-                # Process NL features
-                nl_inputs = batch[3].to(args.device)
-                nl_outputs = model(nl_inputs=nl_inputs)
-                
-                # Extract and save NL features
-                nl_vec = nl_outputs[1][target_idx_in_batch:target_idx_in_batch+1]
-                np.save(os.path.join(features_output_dir, 'train_nl_cls_token.npy'), 
-                       nl_vec.cpu().numpy())
-                
-                nl_last_layer_attention = nl_outputs[3][-1][target_idx_in_batch:target_idx_in_batch+1]
-                nl_cls_attention = nl_last_layer_attention[:, :, 0, :].mean(dim=1)
-                np.save(os.path.join(features_output_dir, 'train_nl_attention.npy'),
-                       nl_cls_attention.cpu().numpy())
-                
-                nl_last_hidden = nl_outputs[2][-2][target_idx_in_batch:target_idx_in_batch+1]
-                nl_final_hidden = nl_outputs[2][-1][target_idx_in_batch:target_idx_in_batch+1, 0, :]
-                nl_last_hidden[:, 0, :] = nl_final_hidden
-                np.save(os.path.join(features_output_dir, 'train_nl_tokens.npy'),
-                       nl_last_hidden.cpu().numpy())
-                
-                del nl_outputs, nl_vec, nl_last_layer_attention, nl_cls_attention
-                del nl_last_hidden, nl_final_hidden
-                
-                # Process code features
-                code_inputs = batch[0].to(args.device)
-                attn_mask = batch[1].to(args.device)
-                position_idx = batch[2].to(args.device)
-                code_outputs = model(code_inputs=code_inputs, attn_mask=attn_mask, position_idx=position_idx)
-                
-                # Extract and save code features
-                code_vec = code_outputs[1][target_idx_in_batch:target_idx_in_batch+1]
-                np.save(os.path.join(features_output_dir, 'train_code_cls_token.npy'),
-                       code_vec.cpu().numpy())
-                
-                code_last_layer_attention = code_outputs[3][-1][target_idx_in_batch:target_idx_in_batch+1]
-                code_cls_attention = code_last_layer_attention[:, :, 0, :].mean(dim=1)
-                np.save(os.path.join(features_output_dir, 'train_code_attention.npy'),
-                       code_cls_attention.cpu().numpy())
-                
-                code_last_hidden = code_outputs[2][-2][target_idx_in_batch:target_idx_in_batch+1]
-                code_final_hidden = code_outputs[2][-1][target_idx_in_batch:target_idx_in_batch+1, 0, :]
-                code_last_hidden[:, 0, :] = code_final_hidden
-                np.save(os.path.join(features_output_dir, 'train_code_tokens.npy'),
-                       code_last_hidden.cpu().numpy())
-                
-                del code_outputs, code_vec, code_last_layer_attention, code_cls_attention
-                del code_last_hidden, code_final_hidden
-                
-                print(f"Saved features for epoch {epoch}")
-                break
-                
-        # Clear GPU memory
-        torch.cuda.empty_cache()
-
-def save_diff_sample_features(args, model, tokenizer, pool):
-    """ Save features for a single specified sample across all epochs """
-    # Get training dataset
-    train_dataset = TextDataset(tokenizer, args, args.train_data_file, pool)
-    train_sampler = SequentialSampler(train_dataset)
-    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=4)
-    
-    # Multi-gpu setup
-    if args.n_gpu > 1:
-        model = torch.nn.DataParallel(model)
-
-    # Load target sample indices
-    nl_target_idx = 92  # Specify which sample's NL to track
-    code_target_idx = 92  # Specify which sample's code to track
-    batch_size = args.train_batch_size
-    
-    nl_target_batch = nl_target_idx // batch_size
-    nl_target_idx_in_batch = nl_target_idx % batch_size
-    
-    code_target_batch = code_target_idx // batch_size
-    code_target_idx_in_batch = code_target_idx % batch_size
-
-    # Track features across epochs 1-50
-    for epoch in range(50, 51):
-        # Load model checkpoint for current epoch
-        output_dir = os.path.join(args.output_dir, f'Epoch_{epoch}')
-        ckpt_output_path = os.path.join(output_dir, 'subject_model_only_multiple_aa_labeled_simple.pth')
-        
-        # Create output directory for features
-        features_output_dir = os.path.join("/home/yiming/cophi/training_dynamic/features/only_aa_labeled_multi_epochs", f'Epoch_{epoch}')
-        os.makedirs(features_output_dir, exist_ok=True)
-        
-        # Load model state
-        model.load_state_dict(torch.load(ckpt_output_path), strict=False)
-        model.to(args.device)
-        model.eval()
-
-        # Process target batches
-        with torch.no_grad():
-            for step, batch in enumerate(train_dataloader):
-                # Skip batches that don't contain our target samples
-                if step < min(nl_target_batch, code_target_batch):
-                    continue
-                
-                if step == nl_target_batch:
-                    # Process NL features
-                    nl_inputs = batch[3].to(args.device)
-                    nl_outputs = model(nl_inputs=nl_inputs)
-                    
-                    # Extract and save NL features
-                    nl_vec = nl_outputs[1][nl_target_idx_in_batch:nl_target_idx_in_batch+1]
-                    np.save(os.path.join(features_output_dir, 'train_nl_cls_token.npy'), 
-                           nl_vec.cpu().numpy())
-                    
-                    nl_last_layer_attention = nl_outputs[3][-1][nl_target_idx_in_batch:nl_target_idx_in_batch+1]
-                    nl_cls_attention = nl_last_layer_attention[:, :, 0, :].mean(dim=1)
-                    np.save(os.path.join(features_output_dir, 'train_nl_attention.npy'),
-                           nl_cls_attention.cpu().numpy())
-                    
-                    nl_last_hidden = nl_outputs[2][-2][nl_target_idx_in_batch:nl_target_idx_in_batch+1]
-                    nl_final_hidden = nl_outputs[2][-1][nl_target_idx_in_batch:nl_target_idx_in_batch+1, 0, :]
-                    nl_last_hidden[:, 0, :] = nl_final_hidden
-                    np.save(os.path.join(features_output_dir, 'train_nl_tokens.npy'),
-                           nl_last_hidden.cpu().numpy())
-                    
-                    del nl_outputs, nl_vec, nl_last_layer_attention, nl_cls_attention
-                    del nl_last_hidden, nl_final_hidden
-                
-                if step == code_target_batch:
-                    # Process code features
-                    code_inputs = batch[0].to(args.device)
-                    attn_mask = batch[1].to(args.device)
-                    position_idx = batch[2].to(args.device)
-                    code_outputs = model(code_inputs=code_inputs, attn_mask=attn_mask, position_idx=position_idx)
-                    
-                    # Extract and save code features
-                    code_vec = code_outputs[1][code_target_idx_in_batch:code_target_idx_in_batch+1]
-                    np.save(os.path.join(features_output_dir, 'train_code_cls_token.npy'),
-                           code_vec.cpu().numpy())
-                    
-                    code_last_layer_attention = code_outputs[3][-1][code_target_idx_in_batch:code_target_idx_in_batch+1]
-                    code_cls_attention = code_last_layer_attention[:, :, 0, :].mean(dim=1)
-                    np.save(os.path.join(features_output_dir, 'train_code_attention.npy'),
-                           code_cls_attention.cpu().numpy())
-                    
-                    code_last_hidden = code_outputs[2][-2][code_target_idx_in_batch:code_target_idx_in_batch+1]
-                    code_final_hidden = code_outputs[2][-1][code_target_idx_in_batch:code_target_idx_in_batch+1, 0, :]
-                    code_last_hidden[:, 0, :] = code_final_hidden
-                    np.save(os.path.join(features_output_dir, 'train_code_tokens.npy'),
-                           code_last_hidden.cpu().numpy())
-                    
-                    del code_outputs, code_vec, code_last_layer_attention, code_cls_attention
-                    del code_last_hidden, code_final_hidden
-                
-                if step > max(nl_target_batch, code_target_batch):
-                    print(f"Saved features for epoch {epoch}")
-                    break
-        # Clear GPU memory
-        torch.cuda.empty_cache()
-
-def save_labeled_sample_cls(args, model, tokenizer, pool):
-    """ Save features for all labeled samples across all epochs """
-    # Load sample indices from file
-    input_path = "/home/yiming/cophi/projects/fork/CodeBERT/GraphCodeBERT/codesearch/auto_labelling/sorted_labelling_sample_api_student_conf_sorted.jsonl"
-    sample_indices = []
-
-    with open(input_path, 'r', encoding='utf-8') as file:
-        for line in file:
-            line = line.strip().rstrip(',')
-            json_obj = json.loads(line)
-            sample_indices.append(json_obj['idx'])
-            
-    # Get training dataset
-    train_dataset = TextDataset(tokenizer, args, args.train_data_file, pool)
-    train_sampler = SequentialSampler(train_dataset)
-    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=4)
-    
-    # Multi-gpu setup
-    if args.n_gpu > 1:
-        model = torch.nn.DataParallel(model)
-
-    # Track features across epochs 1-50
-    for epoch in range(1, 51):
-        # Load model checkpoint for current epoch
-        output_dir = os.path.join(args.output_dir, f'Epoch_{epoch}')
-        ckpt_output_path = os.path.join(output_dir, 'subject_model_only_multiple_aa_labeled_simple.pth')
-        
-        # Create output directory for features
-        features_output_dir = os.path.join("/home/yiming/cophi/training_dynamic/features/only_aa_labeled_multi_epochs_cls", f'Epoch_{epoch}')
-        os.makedirs(features_output_dir, exist_ok=True)
-        
-        # Load model state
-        model.load_state_dict(torch.load(ckpt_output_path), strict=False)
-        model.to(args.device)
-        model.eval()
-
-        # Create subset of labeled samples
-        labeled_indices = torch.tensor(sample_indices)
-        labeled_dataset = torch.utils.data.Subset(train_dataset, labeled_indices)
-        labeled_dataloader = DataLoader(labeled_dataset, batch_size=args.train_batch_size, 
-                                      shuffle=False, num_workers=4)
-
-        nl_cls_tokens = []
-        code_cls_tokens = []
-
-        # Process all batches
-        with torch.no_grad():
-            for batch in labeled_dataloader:
-                # Process NL features
-                nl_inputs = batch[3].to(args.device)
-                nl_outputs = model(nl_inputs=nl_inputs)
-                
-                # Extract NL CLS tokens
-                nl_vec = nl_outputs[1]
-                nl_cls_tokens.append(nl_vec.cpu().numpy())
-                
-                del nl_outputs, nl_vec
-                
-                # Process code features
-                code_inputs = batch[0].to(args.device)
-                attn_mask = batch[1].to(args.device)
-                position_idx = batch[2].to(args.device)
-                code_outputs = model(code_inputs=code_inputs, attn_mask=attn_mask, position_idx=position_idx)
-                
-                # Extract code CLS tokens
-                code_vec = code_outputs[1]
-                code_cls_tokens.append(code_vec.cpu().numpy())
-                
-                del code_outputs, code_vec
-
-            # Save concatenated features
-            nl_cls_tokens = np.concatenate(nl_cls_tokens, axis=0)
-            code_cls_tokens = np.concatenate(code_cls_tokens, axis=0)
-            print(nl_cls_tokens.shape)
-            print(code_cls_tokens.shape)
-            
-            np.save(os.path.join(features_output_dir, 'train_nl_cls_tokens.npy'), nl_cls_tokens)
-            np.save(os.path.join(features_output_dir, 'train_code_cls_tokens.npy'), code_cls_tokens)
-                
-            print(f"Saved features for epoch {epoch}")
-                
-        # Clear GPU memory
-        torch.cuda.empty_cache()
-
-def save_labeled_sample_cl_valid(args, model, tokenizer, pool):
-    """ Save features for all validation samples across all epochs """
-    # Get validation datasets
-    valid_nl_dataset = TextDataset(tokenizer, args, args.eval_data_file, pool)
-    valid_code_dataset = TextDataset(tokenizer, args, args.codebase_file, pool)
-    
-    # valid_nl_sampler = SequentialSampler(valid_nl_dataset)
-    # valid_code_sampler = SequentialSampler(valid_code_dataset)
-    
-    valid_nl_dataloader = DataLoader(valid_nl_dataset, batch_size=args.train_batch_size, 
-                                   shuffle=False, num_workers=4)
-    valid_code_dataloader = DataLoader(valid_code_dataset, batch_size=args.train_batch_size,
-                                     shuffle=False, num_workers=4)
-    
-    # Multi-gpu setup
-    if args.n_gpu > 1:
-        model = torch.nn.DataParallel(model)
-
-    # Track features across epochs 1-50
-    for epoch in range(1, 11):
-        # Load model checkpoint for current epoch
-        output_dir = os.path.join(args.output_dir, f'Epoch_{epoch}')
-        ckpt_output_path = os.path.join(output_dir, 'subject_model_only_multiple_aa_labeled_simple_10k_2.pth')
-        
-        # Create output directory for features
-        features_output_dir = os.path.join("/home/yiming/cophi/training_dynamic/features/only_aa_labeled_multi_epochs_cls_valid", f'Epoch_{epoch}')
-        os.makedirs(features_output_dir, exist_ok=True)
-        
-        # Load model state
-        model.load_state_dict(torch.load(ckpt_output_path), strict=False)
-        model.to(args.device)
-        model.eval()
-
-        # Process NL features first
-        nl_cls_tokens = []
-        with torch.no_grad():
-            for batch in valid_nl_dataloader:
-                nl_inputs = batch[3].to(args.device)
-                nl_outputs = model(nl_inputs=nl_inputs)
-                
-                # Extract NL CLS tokens
-                nl_vec = nl_outputs[1]
-                nl_cls_tokens.append(nl_vec.cpu().numpy())
-                
-                del nl_outputs, nl_vec
-                
-            # Save NL features
-            nl_cls_tokens = np.concatenate(nl_cls_tokens, axis=0)
-            print(f"NL features shape: {nl_cls_tokens.shape}")
-            np.save(os.path.join(features_output_dir, 'valid_nl_cls_tokens.npy'), nl_cls_tokens)
-            del nl_cls_tokens
-            print(f"Saved NL validation features for epoch {epoch}")
-            
-        # Clear GPU memory
-        torch.cuda.empty_cache()
-            
-        # Process code features
-        code_cls_tokens = []
-        with torch.no_grad():
-            for batch in valid_code_dataloader:
-                code_inputs = batch[0].to(args.device)
-                attn_mask = batch[1].to(args.device)
-                position_idx = batch[2].to(args.device)
-                code_outputs = model(code_inputs=code_inputs, attn_mask=attn_mask, position_idx=position_idx)
-                
-                # Extract code CLS tokens
-                code_vec = code_outputs[1]
-                code_cls_tokens.append(code_vec.cpu().numpy())
-                
-                del code_outputs, code_vec
-                
-            # Save code features
-            code_cls_tokens = np.concatenate(code_cls_tokens, axis=0)
-            print(f"Code features shape: {code_cls_tokens.shape}")
-            np.save(os.path.join(features_output_dir, 'valid_code_cls_tokens.npy'), code_cls_tokens)
-            del code_cls_tokens
-            print(f"Saved code validation features for epoch {epoch}")
-                
-        # Clear GPU memory
-        torch.cuda.empty_cache()
-
-def save_labeled_untrained_sample_embeddings(args, model, tokenizer, pool):
-    """ Save word embedding layer outputs for labeled samples across epochs to memory-mapped files """
-    
-    # Get training dataset
-    train_dataset = TextDataset(tokenizer, args, args.train_data_file, pool)
-    
-    # Load sample indices from file
-    input_path = "/inspire/hdd/ws-f4d69b29-e0a5-44e6-bd92-acf4de9990f0/public-project/liuyiming-240108540153/codesearch/auto_labelling/filtered_samples_remaining.jsonl"
-    sample_indices = []
-
-    with open(input_path, 'r', encoding='utf-8') as file:
-        for line in file:
-            line = line.strip().rstrip(',')
-            json_obj = json.loads(line)
-            sample_indices.append(json_obj['idx'])
-    
-    # Multi-gpu setup
-    if args.n_gpu > 1:
-        model = torch.nn.DataParallel(model)
-    
-    output_dir = os.path.join(args.output_dir, f'Epoch_{10}')
-    ckpt_output_path = os.path.join(output_dir, 'subject_model_sigmoid_mask_filtered_3.pth')
-        
-    # Load model state
-    model.load_state_dict(torch.load(ckpt_output_path), strict=False)
-    model.to(args.device)
     model.eval()
+    output_dir = os.path.join(args.output_dir, 'Epoch_{}'.format(40))
+    ckpt_output_path = os.path.join(output_dir, 'subject_model_retrieval_only.pth')
 
-    # Create subset of labeled samples
-    labeled_indices = torch.tensor(sample_indices)
-    labeled_dataset = torch.utils.data.Subset(train_dataset, labeled_indices)
-    labeled_dataloader = DataLoader(labeled_dataset, batch_size=args.train_batch_size, 
-                                    shuffle=False, num_workers=4)
+    model.load_state_dict(torch.load(ckpt_output_path),strict=False) 
+    model.to(args.device)
+    nl_token = []
+    nl_tokens = []
+    all_nl_cls_attention = []
+    code_token = []
+    code_tokens = []
+    all_code_cls_attention = []
+    tokenized_id = []
 
-    
-    # Create output directory
-    features_output_dir = "/inspire/hdd/ws-f4d69b29-e0a5-44e6-bd92-acf4de9990f0/public-project/liuyiming-240108540153/training_dynamic/features/word_embeddings"
-    os.makedirs(features_output_dir, exist_ok=True)
-    
-    # Define memory-mapped file paths
-    num_docs = len(labeled_dataloader)
-    seq_len_doc = 128
-    hidden_dim = 768  # Extract hidden dimension
-    nl_memmap_path = os.path.join(features_output_dir, 'untrain_nl_word_embeddings.dat')
-    code_memmap_path = os.path.join(features_output_dir, 'untrain_code_word_embeddings.dat')
-    nl_attn_memmap_path = os.path.join(features_output_dir, 'untrain_nl_attention_weights.dat')
-    code_attn_memmap_path = os.path.join(features_output_dir, 'untrain_code_attention_weights.dat')
-    
-    num_codes = len(labeled_dataloader)
-    seq_len_code = 320
-    
-    nl_memmap = np.memmap(nl_memmap_path, dtype='float32', mode='w+', shape=(num_docs, seq_len_doc, hidden_dim))
-    code_memmap = np.memmap(code_memmap_path, dtype='float32', mode='w+', shape=(num_codes, seq_len_code, hidden_dim))
-    nl_attn_memmap = np.memmap(nl_attn_memmap_path, dtype='float32', mode='w+', shape=(num_docs, 12, 1, seq_len_doc))
-    code_attn_memmap = np.memmap(code_attn_memmap_path, dtype='float32', mode='w+', shape=(num_codes, 12, 1, seq_len_code))
-    
-    sample_idx = 0
-
-    with torch.no_grad():
-        for step, batch in tqdm(enumerate(labeled_dataloader), total=len(labeled_dataloader), desc="Processing batches"):
-            # Process NL features
-            nl_inputs = batch[3].to(args.device)
-            nl_outputs = model(nl_inputs=nl_inputs)
-            
-            # Process code features
-            code_inputs = batch[0].to(args.device)
-            attn_mask = batch[1].to(args.device)
-            position_idx = batch[2].to(args.device)
-            code_outputs = model(code_inputs=code_inputs, attn_mask=attn_mask, position_idx=position_idx)
-
-            # Extract word embeddings directly from the embedding layer
-            code_embeddings = code_outputs[2][0].cpu().numpy()
-            nl_embeddings = nl_outputs[2][0].cpu().numpy()
-            
-            batch_size = code_embeddings.shape[0]
-            nl_memmap[sample_idx:sample_idx+batch_size] = nl_embeddings
-            code_memmap[sample_idx:sample_idx+batch_size] = code_embeddings
-
-            for target_idx_in_batch in range(len(nl_inputs)):
-                nl_tokens_2 = (nl_inputs[target_idx_in_batch] == 2).nonzero().flatten()
-                total_comment_tokens = 127 - 1 if len(nl_tokens_2) == 0 else int(nl_tokens_2[0].item() - 1)
-                nl_attention_new = model.get_new_attention_tokens_for_code_or_nl(
-                            nl_outputs, target_idx_in_batch,
-                            total_comment_tokens
-                        ).cpu().numpy()
-                code_tokens_2 = (code_inputs[target_idx_in_batch] == 2).nonzero().flatten()
-                total_code_tokens = 255 - 1 if len(code_tokens_2) == 0 else int(code_tokens_2[0].item() - 1)
-                code_attention_new = model.get_new_attention_tokens_for_code_or_nl(
-                            code_outputs, target_idx_in_batch,
-                            total_code_tokens
-                        ).cpu().numpy()
-
-                nl_attn_memmap[sample_idx:sample_idx+target_idx_in_batch+1] = nl_attention_new
-                code_attn_memmap[sample_idx:sample_idx+target_idx_in_batch+1] = code_attention_new
-
-            sample_idx += batch_size
-            
-            # 定期 flush，防止缓存占用太多内存
-            if (step + 1) % 10 == 0:
-                nl_memmap.flush()
-                code_memmap.flush()
-                nl_attn_memmap.flush()
-                code_attn_memmap.flush()
-                print(f"Flushed data at batch {step + 1}")
-
-    # 最后 flush 确保所有数据写入
-    nl_memmap.flush()
-    code_memmap.flush()
-    nl_attn_memmap.flush()
-    code_attn_memmap.flush()
-    print("Final flush completed.")
-
-def save_labeled_untrained_sample_embeddings_aa_valid(args, model, tokenizer, pool):
-    """ Save word embedding layer outputs for labeled samples across epochs to memory-mapped files """
-    
-    # Get training dataset
-    train_dataset = TextDataset(tokenizer, args, args.train_data_file, pool)
-    
     # Load sample indices from file
-    input_path = "/inspire/hdd/ws-f4d69b29-e0a5-44e6-bd92-acf4de9990f0/public-project/liuyiming-240108540153/codesearch/auto_labelling/filtered_samples_remaining.jsonl"
+    input_path = "/home/yiming/cophi/projects/fork/CodeBERT/GraphCodeBERT/codesearch/sorted_labelling_sample_api.jsonl"
     sample_indices = []
 
     with open(input_path, 'r', encoding='utf-8') as file:
         for line in file:
-            line = line.strip().rstrip(',')
+            line = line.strip().rstrip(',')  # 去除行末的逗号
             json_obj = json.loads(line)
             sample_indices.append(json_obj['idx'])
-    
-    # Multi-gpu setup
-    if args.n_gpu > 1:
-        model = torch.nn.DataParallel(model)
-    
-    output_dir = os.path.join(args.output_dir, f'Epoch_{5}')
-    ckpt_output_path = os.path.join(output_dir, 'subject_model_sigmoid_mask_filtered_3.pth')
-        
-    # Load model state
-    model.load_state_dict(torch.load(ckpt_output_path), strict=False)
-    model.to(args.device)
-    model.eval()
 
-    # Create subset of labeled samples
-    labeled_indices = torch.tensor(sample_indices)
-    labeled_dataset = torch.utils.data.Subset(train_dataset, labeled_indices)
-    labeled_dataloader = DataLoader(labeled_dataset, batch_size=args.train_batch_size, 
-                                    shuffle=False, num_workers=4)
+    for step,batch in enumerate(train_dataloader):
+        if step % 1000 == 0:
+            print(step)
+        # batch_start_idx = step * args.train_batch_size
+        # batch_end_idx = batch_start_idx + args.train_batch_size
 
-    
-    # Create output directory
-    features_output_dir = "/inspire/hdd/ws-f4d69b29-e0a5-44e6-bd92-acf4de9990f0/public-project/liuyiming-240108540153/training_dynamic/features/word_embeddings"
-    os.makedirs(features_output_dir, exist_ok=True)
-    
-    # Define memory-mapped file paths
-    num_docs = len(sample_indices)
-    print(num_docs)
-    seq_len_doc = 128
-    hidden_dim = 768  # Extract hidden dimension
-    nl_memmap_path = os.path.join(features_output_dir, 'untrain_nl_word_embeddings.dat')
-    code_memmap_path = os.path.join(features_output_dir, 'untrain_code_word_embeddings.dat')
-    nl_attn_memmap_path = os.path.join(features_output_dir, 'untrain_nl_attention_weights_aa.dat')
-    code_attn_memmap_path = os.path.join(features_output_dir, 'untrain_code_attention_weights_aa.dat')
-    
-    num_codes = len(sample_indices)
-    seq_len_code = 320
-    
-    nl_memmap = np.memmap(nl_memmap_path, dtype='float32', mode='w+', shape=(num_docs, seq_len_doc, hidden_dim))
-    code_memmap = np.memmap(code_memmap_path, dtype='float32', mode='w+', shape=(num_codes, seq_len_code, hidden_dim))
-    nl_attn_memmap = np.memmap(nl_attn_memmap_path, dtype='float32', mode='w+', shape=(num_docs, seq_len_doc))
-    code_attn_memmap = np.memmap(code_attn_memmap_path, dtype='float32', mode='w+', shape=(num_codes, seq_len_code))
-    
-    sample_idx = 0
+        # # Check if current batch contains any samples we want
+        # batch_indices = list(range(batch_start_idx, batch_end_idx))
+        # if not any(idx in sample_indices for idx in batch_indices):
+        #     continue
 
-    with torch.no_grad():
-        for step, batch in tqdm(enumerate(labeled_dataloader), total=len(labeled_dataloader), desc="Processing batches"):
-            # Process NL features
-            nl_inputs = batch[3].to(args.device)
-            nl_outputs = model(nl_inputs=nl_inputs)
-            
-            # Process code features
-            code_inputs = batch[0].to(args.device)
-            attn_mask = batch[1].to(args.device)
-            position_idx = batch[2].to(args.device)
-            code_outputs = model(code_inputs=code_inputs, attn_mask=attn_mask, position_idx=position_idx)
-            # print(len(nl_inputs), len(code_inputs))
+        # # Create mask for samples we want to keep
+        # batch_mask = torch.tensor([idx in sample_indices for idx in batch_indices]).to(args.device)
 
-            # Extract word embeddings directly from the embedding layer
-            code_embeddings = code_outputs[2][-1].cpu().numpy()
-            nl_embeddings = nl_outputs[2][-1].cpu().numpy()
-            # print(nl_embeddings.shape, code_embeddings.shape)
-            
-            batch_size = len(nl_inputs)
-            # print(batch_size)
-            nl_memmap[sample_idx:sample_idx+batch_size] = nl_embeddings
-            code_memmap[sample_idx:sample_idx+batch_size] = code_embeddings
+        # nl_inputs = batch[3].to(args.device)
+        # nl_outputs = model(nl_inputs=nl_inputs)
 
-            nl_last_layer_attention = nl_outputs[3][-1]
-            nl_cls_attention = nl_last_layer_attention[:, :, 0, :].mean(dim=1).cpu().numpy()
-            
-            code_last_layer_attention = code_outputs[3][-1]
-            code_cls_attention = code_last_layer_attention[:, :, 0, :].mean(dim=1).cpu().numpy()
-            
-            nl_attn_memmap[sample_idx:sample_idx+batch_size] = nl_cls_attention
-            code_attn_memmap[sample_idx:sample_idx+batch_size] = code_cls_attention
+        # code_inputs = batch[0].to(args.device)  
+        # attn_mask = batch[1].to(args.device)
+        # position_idx = batch[2].to(args.device)
+        # code_outputs = model(code_inputs=code_inputs,attn_mask=attn_mask,position_idx=position_idx)
 
-            sample_idx += batch_size
-            
-            # 定期 flush，防止缓存占用太多内存
-            if (step + 1) % 10 == 0:
-                # nl_memmap.flush()
-                # code_memmap.flush()
-                nl_attn_memmap.flush()
-                code_attn_memmap.flush()
-                print(f"Flushed data at batch {step + 1}")
+        # # Only store features for samples in our index list
+        # nl_vec = nl_outputs[1][batch_mask]
+        # nl_token.append(nl_vec.cpu().detach().numpy())
 
-    # 最后 flush 确保所有数据写入
-    nl_memmap.flush()
-    code_memmap.flush()
-    nl_attn_memmap.flush()
-    code_attn_memmap.flush()
-    print("Final flush completed.")
+        # nl_attentions = nl_outputs[3]
+        # nl_last_layer_attention = nl_attentions[-1]
+        # nl_cls_attention = nl_last_layer_attention[:, :, 0, :].mean(dim=1)[batch_mask]
+        # all_nl_cls_attention.append(nl_cls_attention.cpu().detach().numpy())
 
-def save_labeled_sample_cl_valid_retri(args, model, tokenizer, pool):
-    """ Save features for all validation samples across all epochs """
-    # Get validation datasets
-    valid_nl_dataset = TextDataset(tokenizer, args, args.eval_data_file, pool)
-    valid_code_dataset = TextDataset(tokenizer, args, args.codebase_file, pool)
+        # code_vec = code_outputs[1][batch_mask]
+        # code_token.append(code_vec.cpu().detach().numpy())
+
+        # code_attentions = code_outputs[3]
+        # code_last_layer_attention = code_attentions[-1]
+        # code_cls_attention = code_last_layer_attention[:, :, 0, :].mean(dim=1)[batch_mask]
+        # all_code_cls_attention.append(code_cls_attention.cpu().detach().numpy())
+
+        # nl_last_hidden_state = nl_outputs[2][-2]  # Get -2 layer hidden states
+        # nl_final_hidden_state = nl_outputs[2][-1][:,0,:]  # Get -1 layer hidden states
+        # filtered_nl_hidden_states = nl_last_hidden_state[batch_mask]
+        # filtered_nl_final_states = nl_final_hidden_state[batch_mask]
+        # filtered_nl_hidden_states[:,0,:] = filtered_nl_final_states
+        # nl_tokens.append(filtered_nl_hidden_states.cpu().detach().numpy())
+
+        # code_last_hidden_state = code_outputs[2][-2]  # Get -2 layer hidden states
+        # code_final_hidden_state = code_outputs[2][-1][:,0,:]  # Get -1 layer hidden states
+        # filtered_code_hidden_states = code_last_hidden_state[batch_mask]
+        # filtered_code_final_states = code_final_hidden_state[batch_mask]
+        # filtered_code_hidden_states[:,0,:] = filtered_code_final_states
+        # code_tokens.append(filtered_code_hidden_states.cpu().detach().numpy())
+
+        # save code tokenize result
+        ori2cur_pos = batch[4].to(args.device)
+        # 使用 extend 将整个 ori2cur_pos 列表的内容添加到 tokenized_id
+        tokenized_id.extend(ori2cur_pos.tolist())
+
+
+    output_dir = "/home/yiming/cophi/training_dynamic/features/retri_single_sample"
+
+    # nl_token = np.concatenate(nl_token, 0)
+    # nl_tokens = np.concatenate(nl_tokens, 0)
+    # all_nl_cls_attention = np.concatenate(all_nl_cls_attention, 0)
     
-    # valid_nl_sampler = SequentialSampler(valid_nl_dataset)
-    # valid_code_sampler = SequentialSampler(valid_code_dataset)
-    
-    valid_nl_dataloader = DataLoader(valid_nl_dataset, batch_size=args.train_batch_size, 
-                                   shuffle=False, num_workers=4)
-    valid_code_dataloader = DataLoader(valid_code_dataset, batch_size=args.train_batch_size,
-                                     shuffle=False, num_workers=4)
-    
-    # Multi-gpu setup
-    if args.n_gpu > 1:
-        model = torch.nn.DataParallel(model)
+    # print(nl_token.shape)
+    # nl_token_output_path = os.path.join(output_dir, 'train_nl_cls_token_retri.npy')
+    # np.save(nl_token_output_path, nl_token)
 
-    # Track features across epochs 1-50
-    for epoch in range(1, 11):
-        # Load model checkpoint for current epoch
-        output_dir = os.path.join(args.output_dir, f'Epoch_{epoch}')
-        ckpt_output_path = os.path.join(output_dir, 'subject_model_labeled_retrieval_only_2.pth')
-        
-        # Create output directory for features
-        features_output_dir = os.path.join("/home/yiming/cophi/training_dynamic/features/only_aa_labeled_multi_epochs_cls_valid_retri", f'Epoch_{epoch}')
-        os.makedirs(features_output_dir, exist_ok=True)
-        
-        # Load model state
-        model.load_state_dict(torch.load(ckpt_output_path), strict=False)
-        model.to(args.device)
-        model.eval()
+    # ## cls accumulative attention
+    # print(all_nl_cls_attention.shape)
+    # nl_attention_output_path = os.path.join(output_dir, 'train_nl_attention_retri.npy')
+    # np.save(nl_attention_output_path, all_nl_cls_attention)
 
-        # Process NL features first
-        nl_cls_tokens = []
-        with torch.no_grad():
-            for batch in valid_nl_dataloader:
-                nl_inputs = batch[3].to(args.device)
-                nl_outputs = model(nl_inputs=nl_inputs)
-                
-                # Extract NL CLS tokens
-                nl_vec = nl_outputs[1]
-                nl_cls_tokens.append(nl_vec.cpu().numpy())
-                
-                del nl_outputs, nl_vec
-                
-            # Save NL features
-            nl_cls_tokens = np.concatenate(nl_cls_tokens, axis=0)
-            print(f"NL features shape: {nl_cls_tokens.shape}")
-            np.save(os.path.join(features_output_dir, 'valid_nl_cls_tokens_retri.npy'), nl_cls_tokens)
-            del nl_cls_tokens
-            print(f"Saved retrieval NL validation features for epoch {epoch}")
-            
-        # Clear GPU memory
-        torch.cuda.empty_cache()
-            
-        # Process code features
-        code_cls_tokens = []
-        with torch.no_grad():
-            for batch in valid_code_dataloader:
-                code_inputs = batch[0].to(args.device)
-                attn_mask = batch[1].to(args.device)
-                position_idx = batch[2].to(args.device)
-                code_outputs = model(code_inputs=code_inputs, attn_mask=attn_mask, position_idx=position_idx)
-                
-                # Extract code CLS tokens
-                code_vec = code_outputs[1]
-                code_cls_tokens.append(code_vec.cpu().numpy())
-                
-                del code_outputs, code_vec
-                
-            # Save code features
-            code_cls_tokens = np.concatenate(code_cls_tokens, axis=0)
-            print(f"Code features shape: {code_cls_tokens.shape}")
-            np.save(os.path.join(features_output_dir, 'valid_code_cls_tokens_retri.npy'), code_cls_tokens)
-            del code_cls_tokens
-            print(f"Saved retrieval code validation features for epoch {epoch}")
-                
-        # Clear GPU memory
-        torch.cuda.empty_cache()
+    # print(nl_tokens.shape)
+    # nl_tokens_output_path = os.path.join(output_dir, 'train_nl_tokens_retri.npy')
+    # np.save(nl_tokens_output_path, nl_tokens)
+    
+    print(len(tokenized_id))
+    with open('/home/yiming/cophi/training_dynamic/features/tokenized_id_train.json', 'w') as f:
+        json.dump(tokenized_id, f)
 
-def save_diff_sample_features_valid(args, model, tokenizer, pool):
-    """ Save validation features for both NL and code across all epochs """
-    # Get validation datasets
-    valid_nl_dataset = TextDataset(tokenizer, args, args.eval_data_file, pool)
-    valid_code_dataset = TextDataset(tokenizer, args, args.codebase_file, pool)
+    # code_token = np.concatenate(code_token, 0)
+    # code_tokens = np.concatenate(code_tokens, 0)
+    # all_code_cls_attention = np.concatenate(all_code_cls_attention, 0)
     
-    valid_nl_sampler = SequentialSampler(valid_nl_dataset)
-    valid_code_sampler = SequentialSampler(valid_code_dataset)
-    
-    valid_nl_dataloader = DataLoader(valid_nl_dataset, sampler=valid_nl_sampler, batch_size=args.train_batch_size, num_workers=4)
-    valid_code_dataloader = DataLoader(valid_code_dataset, sampler=valid_code_sampler, batch_size=args.train_batch_size, num_workers=4)
-    
-    # Multi-gpu setup
-    if args.n_gpu > 1:
-        model = torch.nn.DataParallel(model)
+    # print(code_token.shape)
+    # code_token_output_path = os.path.join(output_dir, 'train_code_cls_token_retri.npy')
+    # np.save(code_token_output_path, code_token)
 
-    # Target indices to track
-    nl_target_idx = 4468  # Specify which validation NL sample to track
-    code_target_idx = 28607  # Specify which validation code sample to track
-    batch_size = args.train_batch_size
-    
-    nl_target_batch = nl_target_idx // batch_size
-    nl_target_idx_in_batch = nl_target_idx % batch_size
-    
-    code_target_batch = code_target_idx // batch_size
-    code_target_idx_in_batch = code_target_idx % batch_size
+    # print(all_code_cls_attention.shape)
+    # code_attention_output_path = os.path.join(output_dir, 'train_code_attention_retri.npy')
+    # np.save(code_attention_output_path, all_code_cls_attention)
 
-    # Track features across epochs 1-50
-    for epoch in range(1, 2):
-        # Load model checkpoints for current epoch
-        output_dir = os.path.join(args.output_dir, f'Epoch_{epoch}')
-        
-        # Load current model checkpoint
-        curr_ckpt_path = os.path.join(output_dir, 'subject_model_only_multiple_aa_labeled_simple_10k_2.pth')
-        # Load retrieval model checkpoint 
-        retri_ckpt_path = os.path.join(output_dir, 'subject_model_labeled_retrieval_only_2.pth')
-        
-        # Create output directory for features
-        features_output_dir = os.path.join("/home/yiming/cophi/training_dynamic/features/only_aa_labeled_multi_epochs", f'Epoch_{epoch}')
-        os.makedirs(features_output_dir, exist_ok=True)
+    # print(code_tokens.shape)
+    # code_token_output_path = os.path.join(output_dir, 'train_code_tokens_retri.npy')
+    # np.save(code_token_output_path, code_tokens)
 
-        # Process with current model
-        model.load_state_dict(torch.load(curr_ckpt_path), strict=False)
-        model.to(args.device)
-        model.eval()
-        
-        # Process target batches with current model
-        with torch.no_grad():
-            # Process NL features
-            for step, batch in enumerate(valid_nl_dataloader):
-                if step == nl_target_batch:
-                    nl_inputs = batch[3].to(args.device)
-                    nl_outputs = model(nl_inputs=nl_inputs)
-                    
-                    # Extract and save NL features
-                    nl_vec = nl_outputs[1][nl_target_idx_in_batch:nl_target_idx_in_batch+1]
-                    np.save(os.path.join(features_output_dir, 'valid_nl_cls_token_curr.npy'), 
-                           nl_vec.cpu().numpy())
-                    
-                    nl_last_layer_attention = nl_outputs[3][-1][nl_target_idx_in_batch:nl_target_idx_in_batch+1]
-                    nl_cls_attention = nl_last_layer_attention[:, :, 0, :].mean(dim=1)
-                    np.save(os.path.join(features_output_dir, 'valid_nl_attention_curr.npy'),
-                           nl_cls_attention.cpu().numpy())
-                    
-                    nl_last_hidden = nl_outputs[2][-2][nl_target_idx_in_batch:nl_target_idx_in_batch+1]
-                    nl_final_hidden = nl_outputs[2][-1][nl_target_idx_in_batch:nl_target_idx_in_batch+1, 0, :]
-                    nl_last_hidden[:, 0, :] = nl_final_hidden
-                    np.save(os.path.join(features_output_dir, 'valid_nl_tokens_curr.npy'),
-                           nl_last_hidden.cpu().numpy())
-                    
-                    del nl_outputs, nl_vec, nl_last_layer_attention, nl_cls_attention
-                    del nl_last_hidden, nl_final_hidden
-                    break
-                    
-            # Process code features
-            for step, batch in enumerate(valid_code_dataloader):
-                if step == code_target_batch:
-                    code_inputs = batch[0].to(args.device)
-                    attn_mask = batch[1].to(args.device)
-                    position_idx = batch[2].to(args.device)
-                    code_outputs = model(code_inputs=code_inputs, attn_mask=attn_mask, position_idx=position_idx)
-                    
-                    # Extract and save code features
-                    code_vec = code_outputs[1][code_target_idx_in_batch:code_target_idx_in_batch+1]
-                    np.save(os.path.join(features_output_dir, 'valid_code_cls_token_curr.npy'),
-                           code_vec.cpu().numpy())
-                    
-                    code_last_layer_attention = code_outputs[3][-1][code_target_idx_in_batch:code_target_idx_in_batch+1]
-                    code_cls_attention = code_last_layer_attention[:, :, 0, :].mean(dim=1)
-                    np.save(os.path.join(features_output_dir, 'valid_code_attention_curr.npy'),
-                           code_cls_attention.cpu().numpy())
-                    
-                    code_last_hidden = code_outputs[2][-2][code_target_idx_in_batch:code_target_idx_in_batch+1]
-                    code_final_hidden = code_outputs[2][-1][code_target_idx_in_batch:code_target_idx_in_batch+1, 0, :]
-                    code_last_hidden[:, 0, :] = code_final_hidden
-                    np.save(os.path.join(features_output_dir, 'valid_code_tokens_curr.npy'),
-                           code_last_hidden.cpu().numpy())
-                    
-                    del code_outputs, code_vec, code_last_layer_attention, code_cls_attention
-                    del code_last_hidden, code_final_hidden
-                    break
-                    
-            print(f"Saved current model validation features for epoch {epoch}")
-                    
-        # Clear GPU memory
-        torch.cuda.empty_cache()
-        
-        # Process with retrieval model
-        model.load_state_dict(torch.load(retri_ckpt_path), strict=False)
-        model.to(args.device)
-        model.eval()
-        
-        # Process target batches with retrieval model
-        with torch.no_grad():
-            # Process NL features
-            for step, batch in enumerate(valid_nl_dataloader):
-                if step == nl_target_batch:
-                    nl_inputs = batch[3].to(args.device)
-                    nl_outputs = model(nl_inputs=nl_inputs)
-                    
-                    # Extract and save NL features
-                    nl_vec = nl_outputs[1][nl_target_idx_in_batch:nl_target_idx_in_batch+1]
-                    np.save(os.path.join(features_output_dir, 'valid_nl_cls_token_retri.npy'), 
-                           nl_vec.cpu().numpy())
-                    
-                    nl_last_layer_attention = nl_outputs[3][-1][nl_target_idx_in_batch:nl_target_idx_in_batch+1]
-                    nl_cls_attention = nl_last_layer_attention[:, :, 0, :].mean(dim=1)
-                    np.save(os.path.join(features_output_dir, 'valid_nl_attention_retri.npy'),
-                           nl_cls_attention.cpu().numpy())
-                    
-                    nl_last_hidden = nl_outputs[2][-2][nl_target_idx_in_batch:nl_target_idx_in_batch+1]
-                    nl_final_hidden = nl_outputs[2][-1][nl_target_idx_in_batch:nl_target_idx_in_batch+1, 0, :]
-                    nl_last_hidden[:, 0, :] = nl_final_hidden
-                    np.save(os.path.join(features_output_dir, 'valid_nl_tokens_retri.npy'),
-                           nl_last_hidden.cpu().numpy())
-                    
-                    del nl_outputs, nl_vec, nl_last_layer_attention, nl_cls_attention
-                    del nl_last_hidden, nl_final_hidden
-                    break
-                    
-            # Process code features
-            for step, batch in enumerate(valid_code_dataloader):
-                if step == code_target_batch:
-                    code_inputs = batch[0].to(args.device)
-                    attn_mask = batch[1].to(args.device)
-                    position_idx = batch[2].to(args.device)
-                    code_outputs = model(code_inputs=code_inputs, attn_mask=attn_mask, position_idx=position_idx)
-                    
-                    # Extract and save code features
-                    code_vec = code_outputs[1][code_target_idx_in_batch:code_target_idx_in_batch+1]
-                    np.save(os.path.join(features_output_dir, 'valid_code_cls_token_retri.npy'),
-                           code_vec.cpu().numpy())
-                    
-                    code_last_layer_attention = code_outputs[3][-1][code_target_idx_in_batch:code_target_idx_in_batch+1]
-                    code_cls_attention = code_last_layer_attention[:, :, 0, :].mean(dim=1)
-                    np.save(os.path.join(features_output_dir, 'valid_code_attention_retri.npy'),
-                           code_cls_attention.cpu().numpy())
-                    
-                    code_last_hidden = code_outputs[2][-2][code_target_idx_in_batch:code_target_idx_in_batch+1]
-                    code_final_hidden = code_outputs[2][-1][code_target_idx_in_batch:code_target_idx_in_batch+1, 0, :]
-                    code_last_hidden[:, 0, :] = code_final_hidden
-                    np.save(os.path.join(features_output_dir, 'valid_code_tokens_retri.npy'),
-                           code_last_hidden.cpu().numpy())
-                    
-                    del code_outputs, code_vec, code_last_layer_attention, code_cls_attention
-                    del code_last_hidden, code_final_hidden
-                    break
-                    
-            print(f"Saved retrieval model validation features for epoch {epoch}")
-                    
-        # Clear GPU memory
-        torch.cuda.empty_cache()
-
-def save_labeled_sample_cls_cosqa(args, model, tokenizer, pool):
-    """ Save features for all validation samples across all epochs """
-    # Get validation datasets
-    valid_nl_dataset = TextDataset(tokenizer, args, args.eval_data_file, pool)
-    valid_code_dataset = TextDataset(tokenizer, args, args.codebase_file, pool)
-    
-    valid_nl_sampler = SequentialSampler(valid_nl_dataset)
-    valid_code_sampler = SequentialSampler(valid_code_dataset)
-    
-    valid_nl_dataloader = DataLoader(valid_nl_dataset, batch_size=args.train_batch_size, 
-                                   shuffle=False, num_workers=4)
-    valid_code_dataloader = DataLoader(valid_code_dataset, batch_size=args.train_batch_size,
-                                     shuffle=False, num_workers=4)
-    
-    # Multi-gpu setup
-    if args.n_gpu > 1:
-        model = torch.nn.DataParallel(model)
-
-    # Track features across epochs 1-50
-    for epoch in range(1, 51):
-        # Load model checkpoint for current epoch
-        output_dir = os.path.join(args.output_dir, f'Epoch_{epoch}')
-        ckpt_output_path = os.path.join(output_dir, 'subject_model_only_multiple_aa_labeled_simple.pth')
-        
-        # Create output directory for features
-        features_output_dir = os.path.join("/home/yiming/cophi/training_dynamic/features/only_aa_labeled_multi_epochs_cls_valid", f'Epoch_{epoch}')
-        os.makedirs(features_output_dir, exist_ok=True)
-        
-        # Load model state
-        model.load_state_dict(torch.load(ckpt_output_path), strict=False)
-        model.to(args.device)
-        model.eval()
-
-        # Process NL features first
-        nl_cls_tokens = []
-        with torch.no_grad():
-            for batch in valid_nl_dataloader:
-                nl_inputs = batch[3].to(args.device)
-                nl_outputs = model(nl_inputs=nl_inputs)
-                
-                # Extract NL CLS tokens
-                nl_vec = nl_outputs[1]
-                nl_cls_tokens.append(nl_vec.cpu().numpy())
-                
-                del nl_outputs, nl_vec
-                
-            # Save NL features
-            nl_cls_tokens = np.concatenate(nl_cls_tokens, axis=0)
-            print(f"NL features shape: {nl_cls_tokens.shape}")
-            np.save(os.path.join(features_output_dir, 'valid_nl_cls_tokens.npy'), nl_cls_tokens)
-            del nl_cls_tokens
-            print(f"Saved NL validation features for epoch {epoch}")
-            
-        # Clear GPU memory
-        torch.cuda.empty_cache()
-            
-        # Process code features
-        code_cls_tokens = []
-        with torch.no_grad():
-            for batch in valid_code_dataloader:
-                code_inputs = batch[0].to(args.device)
-                attn_mask = batch[1].to(args.device)
-                position_idx = batch[2].to(args.device)
-                code_outputs = model(code_inputs=code_inputs, attn_mask=attn_mask, position_idx=position_idx)
-                
-                # Extract code CLS tokens
-                code_vec = code_outputs[1]
-                code_cls_tokens.append(code_vec.cpu().numpy())
-                
-                del code_outputs, code_vec
-                
-            # Save code features
-            code_cls_tokens = np.concatenate(code_cls_tokens, axis=0)
-            print(f"Code features shape: {code_cls_tokens.shape}")
-            np.save(os.path.join(features_output_dir, 'valid_code_cls_tokens.npy'), code_cls_tokens)
-            del code_cls_tokens
-            print(f"Saved code validation features for epoch {epoch}")
-                
-        # Clear GPU memory
-        torch.cuda.empty_cache()
 
 def save_valid_attention_features(args, model, tokenizer,pool):
     """ Train the model """
@@ -2680,39 +1772,15 @@ def train_alignment_auto_samples(args, model, tokenizer,pool):
     
     model.zero_grad()
 
-    input_path = "/home/yiming/cophi/projects/fork/CodeBERT/GraphCodeBERT/codesearch/auto_labelling/sorted_labelling_sample_api_student_conf_sorted.jsonl"
-    idx_list = []
-    match_list = []
-
-    with open(input_path, 'r', encoding='utf-8') as file:
-        for line in file:
-            line = line.strip().rstrip(',')  # 去除行末的逗号
-            json_obj = json.loads(line)
-            idx_list.append(json_obj['idx'])
-            match_list.append(json_obj['match'])
-    
-    sample_index = idx_list
-    sample_align = match_list
-
     model.train()
 
     accumulation_steps = 32  # Number of batches to accumulate gradients before updating
     optimizer.zero_grad()  # Reset gradients before starting
 
     for idx in range(args.num_train_epochs):
-        # 初始指针位置为0
-        sample_idx_ptr = 0
-        total_epoch_align_loss = 0
-        total_epoch_attention_loss = 0
         total_epoch_retrieval_loss = 0
-        # total_epoch_mlm_loss = 0
-        total_batches_with_align_loss = 0
         total_batches = 0
-        # if idx == 0:
-        #     output_dir = os.path.join(args.output_dir, 'Epoch_{}'.format(idx+1))
-        #     ckpt_output_path = os.path.join(output_dir, 'subject_model.pth')
-        #     model.load_state_dict(torch.load(ckpt_output_path),strict=False) 
-        #     model.to(args.device)
+
         for step,batch in enumerate(train_dataloader):
             total_batches += 1
             #get inputs
@@ -2720,14 +1788,10 @@ def train_alignment_auto_samples(args, model, tokenizer,pool):
             attn_mask = batch[1].to(args.device)
             position_idx = batch[2].to(args.device)
             nl_inputs = batch[3].to(args.device)
-            ori2cur_pos = batch[4].to(args.device)
             
             code_outputs = model(code_inputs=code_inputs,attn_mask=attn_mask,position_idx=position_idx)
             nl_outputs = model(nl_inputs=nl_inputs)
             
-            batch_start_idx = step * args.train_batch_size
-            batch_end_idx = batch_start_idx + args.train_batch_size
-
             bs = code_inputs.shape[0]
             code_vec = code_outputs[1]
             nl_vec = nl_outputs[1]
@@ -2737,73 +1801,13 @@ def train_alignment_auto_samples(args, model, tokenizer,pool):
             retrieval_loss = loss_fct(scores, torch.arange(code_inputs.size(0), device=scores.device))
             total_epoch_retrieval_loss += retrieval_loss.item()
 
-            # 初始化 align_loss 和 attention_loss 累加变量
-            total_align_loss = 0
-            total_attention_loss = 0
-            # total_mlm_loss = 0
-            align_loss_count = 0  # 记录 align_loss 的数量
-
-            # 从当前指针位置开始检查 sample_index 是否在当前 batch 内
-            while sample_idx_ptr < len(sample_index) and sample_index[sample_idx_ptr] < batch_end_idx:
-                if sample_index[sample_idx_ptr] >= batch_start_idx:
-                    # 计算在当前 batch 范围内的 align_loss 和 attention_loss
-                    local_index = sample_index[sample_idx_ptr] - batch_start_idx
-                    total_code_tokens = min(ori2cur_pos[local_index].max().item(), 255)
-
-                    if isinstance(model, torch.nn.DataParallel):
-                        align_loss, attention_loss = model.module.batch_alignment(
-                            code_inputs, code_outputs, nl_outputs, local_index, sample_align[sample_idx_ptr], total_code_tokens
-                        )
-                    else:
-                        align_loss, attention_loss = model.batch_alignment(
-                            code_inputs, code_outputs, nl_outputs, local_index, sample_align[sample_idx_ptr], total_code_tokens
-                        )
-                    
-                    # # add mlm loss
-                    # if isinstance(model, torch.nn.DataParallel):
-                    #     align_loss, attention_loss, mlm_loss = model.module.batch_alignment_mlm(
-                    #         code_inputs, code_outputs, nl_outputs, local_index, sample_align[sample_idx_ptr], total_code_tokens, tokenizer, attn_mask[local_index], position_idx[local_index], model
-                    #     )
-                    # else:
-                    #     align_loss, attention_loss, mlm_loss = model.batch_alignment_mlm(
-                    #         code_inputs, nl_inputs, code_outputs, nl_outputs, local_index, sample_align[sample_idx_ptr], total_code_tokens, tokenizer, attn_mask[local_index], position_idx[local_index], model
-                    #     )
-
-                    total_align_loss += align_loss
-                    total_attention_loss += 0.1 * attention_loss
-                    # total_mlm_loss += mlm_loss
-                    align_loss_count += 1
-
-                sample_idx_ptr += 1  # 移动指针到下一个 sample_index
-
-            # 如果当前 batch 有 align_loss 和 attention_loss，则加上 retrieval_loss 进行反向传播
-            if align_loss_count > 0:
-                aa_loss = total_align_loss + total_attention_loss + retrieval_loss
-                # aa_loss = total_align_loss + total_attention_loss + retrieval_loss + total_mlm_loss
-                aa_loss.backward()
-                # retrieval_loss.backward()
-                total_epoch_align_loss += total_align_loss.item()
-                total_epoch_attention_loss += total_attention_loss.item()
-                # total_epoch_mlm_loss += total_mlm_loss.item()
-                total_batches_with_align_loss += 1
-                logger.info(
-                    "epoch {} step {} accumulated align loss {} attention loss {} retrieval loss {}".format(
-                        idx, step + 1,
-                        round(total_align_loss.item(), 5),
-                        round(total_attention_loss.item(), 5),
-                        round(retrieval_loss.item(), 5)
-                        # round(total_mlm_loss.item(), 5)
-                    )
+            retrieval_loss.backward()
+            logger.info(
+                "epoch {} step {} retrieval loss {}".format(
+                    idx, step + 1,
+                    round(retrieval_loss.item(), 5)
                 )
-            else:
-                # 只有 retrieval_loss 的情况
-                retrieval_loss.backward()
-                logger.info(
-                    "epoch {} step {} retrieval loss only {}".format(
-                        idx, step + 1,
-                        round(retrieval_loss.item(), 5)
-                    )
-                )
+            )
        
             # Update model parameters and zero gradients every accumulation_steps
             if (step + 1) % accumulation_steps == 0:
@@ -2811,14 +1815,12 @@ def train_alignment_auto_samples(args, model, tokenizer,pool):
                 optimizer.step()
                 optimizer.zero_grad()
                 scheduler.step()
+
         # Calculate average losses for the epoch
-        avg_align_loss = total_epoch_align_loss / total_batches_with_align_loss if total_batches_with_align_loss > 0 else 0
-        avg_attention_loss = total_epoch_attention_loss / total_batches_with_align_loss if total_batches_with_align_loss > 0 else 0
-        # avg_mlm_loss = total_epoch_mlm_loss / total_batches_with_align_loss if total_batches_with_align_loss > 0 else 0
         avg_retrieval_loss = total_epoch_retrieval_loss / total_batches
 
-        logger.info("Epoch {} average losses - Align Loss: {:.5f}, Attention Loss: {:.5f}, Retrieval Loss: {:.5f}".format(
-            idx + 1, avg_align_loss, avg_attention_loss, avg_retrieval_loss
+        logger.info("Epoch {} average losses - Retrieval Loss: {:.5f}".format(
+            idx + 1, avg_retrieval_loss
         ))
 
         #evaluate    
@@ -2830,7 +1832,118 @@ def train_alignment_auto_samples(args, model, tokenizer,pool):
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
         model_to_save = model.module if hasattr(model, 'module') else model
-        ckpt_output_path = os.path.join(output_dir, 'subject_model_new_auto_label_aa.pth')
+        ckpt_output_path = os.path.join(output_dir, 'subject_model_retrieval_only.pth')
+        logger.info("Saving model checkpoint to %s", ckpt_output_path)
+        torch.save(model_to_save.state_dict(), ckpt_output_path)
+
+        print("Model saved.")
+
+def train_alignment_auto_labeled_samples(args, model, tokenizer,pool):
+    """ Train the model """
+    # Load labeled samples first
+    input_path = "/home/yiming/cophi/projects/fork/CodeBERT/GraphCodeBERT/codesearch/auto_labelling/sorted_labelling_sample_api_student_conf_sorted_2.jsonl"
+    idx_list = []
+    match_list = []
+
+    with open(input_path, 'r', encoding='utf-8') as file:
+        for line in file:
+            line = line.strip().rstrip(',')
+            json_obj = json.loads(line)
+            idx_list.append(json_obj['idx'])
+            match_list.append(json_obj['match'])
+
+    # Get full training dataset
+    full_dataset = TextDataset(tokenizer, args, args.train_data_file, pool)
+    
+    # Extract labeled samples to create new dataset
+    labeled_samples = []
+    for idx in idx_list:
+        labeled_samples.append(full_dataset[idx])
+    
+    # Create dataloader for labeled samples only
+    train_sampler = SequentialSampler(labeled_samples)
+    train_dataloader = DataLoader(labeled_samples, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=4)
+    
+    # Get optimizer and scheduler
+    optimizer = AdamW(model.parameters(), lr=args.learning_rate, eps=1e-8)
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0,num_training_steps=len(train_dataloader)*args.num_train_epochs)
+    
+    # Multi-gpu training
+    if args.n_gpu > 1:
+        model = torch.nn.DataParallel(model)
+
+    # Train!
+    logger.info("***** Running training on labeled samples only *****")
+    logger.info("  Num labeled examples = %d", len(labeled_samples))
+    logger.info("  Num Epochs = %d", args.num_train_epochs)
+    logger.info("  Instantaneous batch size per GPU = %d", args.train_batch_size//args.n_gpu)
+    logger.info("  Total train batch size = %d", args.train_batch_size)
+    logger.info("  Total optimization steps = %d", len(train_dataloader)*args.num_train_epochs)
+    
+    model.zero_grad()
+    model.train()
+    
+    accumulation_steps = 8  # Number of batches to accumulate gradients before updating
+    optimizer.zero_grad()
+
+    for idx in range(args.num_train_epochs):
+        total_epoch_retrieval_loss = 0
+        total_batches = 0
+
+        for step, batch in enumerate(train_dataloader):
+            total_batches += 1
+            
+            # Get inputs
+            code_inputs = batch[0].to(args.device)
+            attn_mask = batch[1].to(args.device)
+            position_idx = batch[2].to(args.device)
+            nl_inputs = batch[3].to(args.device)
+            
+            code_outputs = model(code_inputs=code_inputs,attn_mask=attn_mask,position_idx=position_idx)
+            nl_outputs = model(nl_inputs=nl_inputs)
+            
+            code_vec = code_outputs[1]
+            nl_vec = nl_outputs[1]
+
+            scores = torch.einsum("ab,cb->ac",nl_vec,code_vec)
+            loss_fct = CrossEntropyLoss()
+            retrieval_loss = loss_fct(scores, torch.arange(code_inputs.size(0), device=scores.device))
+            total_epoch_retrieval_loss += retrieval_loss.item()
+
+            retrieval_loss.backward()
+            
+            logger.info(
+                "epoch {} step {} retrieval loss {}".format(
+                    idx, step + 1,
+                    round(retrieval_loss.item(), 5)
+                )
+            )
+
+            # if (step + 1) % accumulation_steps == 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+            optimizer.step()
+            optimizer.zero_grad()
+            scheduler.step()
+
+        # Calculate average losses for the epoch
+        avg_retrieval_loss = total_epoch_retrieval_loss / total_batches
+
+        logger.info("Epoch {} average losses - Retrieval Loss: {:.5f}".format(
+            idx + 1, avg_retrieval_loss
+        ))
+
+        # Evaluate every n epochs
+        if (idx + 1) % 10 == 0:
+            results = evaluate(args, model, tokenizer,args.eval_data_file, pool, eval_when_training=True)
+            for key, value in results.items():
+                logger.info("  %s = %s", key, round(value,4))    
+
+        # Save checkpoint
+        output_dir = os.path.join(args.output_dir, 'Epoch_{}'.format(idx + 1))
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        model_to_save = model.module if hasattr(model, 'module') else model
+        ckpt_output_path = os.path.join(output_dir, 'subject_model_labeled_retrieval_only_67k.pth')
         logger.info("Saving model checkpoint to %s", ckpt_output_path)
         torch.save(model_to_save.state_dict(), ckpt_output_path)
 
@@ -3679,12 +2792,7 @@ def main():
         # train_alignment_single_sample(args, model, tokenizer, pool)
         # train_alignment_retrieval_only(args, model, tokenizer, pool)
         # save_train_features(args, model, tokenizer, pool)
-        # save_one_sample_features(args, model, tokenizer, pool)
-        # save_labeled_sample_cls(args, model, tokenizer, pool)
-        # save_diff_sample_features(args, model, tokenizer, pool)
-        save_labeled_sample_cl_valid(args, model, tokenizer, pool)
-        save_labeled_sample_cl_valid_retri(args, model, tokenizer, pool)
-        # save_diff_sample_features_valid(args, model, tokenizer, pool)
+        train_alignment_auto_labeled_samples(args, model, tokenizer, pool)
 
     # Evaluation
     results = {}

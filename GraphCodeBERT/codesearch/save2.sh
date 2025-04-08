@@ -1,6 +1,6 @@
 lang=python
 
-CUDA_VISIBLE_DEVICES=1,2,3 python run.py \
+CUDA_VISIBLE_DEVICES=2 python run_save.py \
 --output_dir /home/yiming/cophi/training_dynamic/graphcodebert \
 --config_name /home/yiming/cophi/projects/graphcodebert-base \
 --model_name_or_path /home/yiming/cophi/projects/graphcodebert-base \
@@ -11,12 +11,12 @@ CUDA_VISIBLE_DEVICES=1,2,3 python run.py \
 --eval_data_file=dataset/$lang/valid.jsonl \
 --test_data_file=dataset/$lang/test.jsonl \
 --codebase_file=dataset/$lang/codebase.jsonl \
---num_train_epochs 2 \
+--num_train_epochs 10 \
 --code_length 256 \
 --data_flow_length 64 \
 --nl_length 128 \
---train_batch_size 16 \
+--train_batch_size 32 \
 --eval_batch_size 64 \
 --learning_rate 2e-5 \
 --seed 123456 \
-2>&1| tee train.log
+2>&1| tee save_train_features2.log

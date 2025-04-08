@@ -9,11 +9,87 @@ import random
 import json
 import os
 from itertools import chain
+import math
+
+# Create new transformer layer for CLS token attention
+class CLSAttentionLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.num_attention_heads = 12
+        self.attention_head_size = 64
+        self.all_head_size = self.num_attention_heads * self.attention_head_size
+        
+        self.query = nn.Linear(768, self.all_head_size)
+        self.key = nn.Linear(768, self.all_head_size)
+        
+        self.dropout = nn.Dropout(0.1)
+        
+        # Initialize weights using Xavier uniform initialization
+        nn.init.xavier_uniform_(self.query.weight)
+        nn.init.zeros_(self.query.bias)
+        nn.init.xavier_uniform_(self.key.weight)
+        nn.init.zeros_(self.key.bias)
+    def transpose_for_scores(self, x):
+        # 1. 首先添加 batch 维度
+        if len(x.size()) == 1:  # 对于 CLS token: [768] -> [1, 1, 768]
+            x = x.unsqueeze(0).unsqueeze(0)
+        elif len(x.size()) == 2:  # 对于 sequence: [320, 768] -> [1, 320, 768]
+            x = x.unsqueeze(0)
+        new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
+        x = x.view(new_x_shape)
+        return x.permute(0, 2, 1, 3)
+        
+    def forward(self, cls_token, sequence_tokens, attention_mask=None):
+        # Move linear layers to same device as input tensors
+        device = cls_token.device
+        self.query = self.query.to(device)
+        self.key = self.key.to(device)
+        
+        # Transform CLS token to query
+        cls_query = self.transpose_for_scores(self.query(cls_token))
+        
+        # Transform all tokens (including CLS) to keys
+        seq_keys = self.transpose_for_scores(self.key(sequence_tokens))
+        
+        # Calculate attention scores
+        attention_scores = torch.matmul(cls_query, seq_keys.transpose(-1, -2))
+        attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+        
+        # Apply attention mask before softmax
+        if attention_mask is not None:
+            # Add batch dimension if needed
+            if len(attention_mask.size()) == 1:
+                attention_mask = attention_mask.unsqueeze(0)
+                
+            # Expand attention mask to match attention scores dimensions
+            attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+            attention_mask = attention_mask.expand(attention_scores.size())
+            
+            attention_scores = attention_scores + (1.0 - attention_mask) * -10000.0
+            
+        # Get attention probabilities
+        attention_probs = nn.functional.softmax(attention_scores, dim=-1)
+        
+        # Apply dropout
+        attention_probs = self.dropout(attention_probs)
+        
+        # Use original sequence embeddings as values
+        sequence_values = self.transpose_for_scores(sequence_tokens)
+        
+        # Calculate new CLS representation
+        new_cls = torch.matmul(attention_probs, sequence_values)
+        new_cls = new_cls.permute(0, 2, 1, 3).contiguous()
+        new_cls_shape = new_cls.size()[:-2] + (self.all_head_size,)
+        new_cls = new_cls.view(new_cls_shape)
+        
+        return new_cls, attention_probs, attention_scores
+
 
 class Model(nn.Module):   
     def __init__(self, encoder):
         super(Model, self).__init__()
         self.encoder = encoder
+        self.cls_attention = CLSAttentionLayer()
       
     def forward(self, code_inputs=None, attn_mask=None,position_idx=None, nl_inputs=None): 
         if code_inputs is not None:
@@ -556,35 +632,20 @@ class Model(nn.Module):
 
         return loss_align_code, attention_loss
     
-    def batch_alignment(self, code_inputs, code_outputs, nl_outputs, local_index, sample_align, total_code_tokens):
+    def batch_alignment(self, code_inputs, code_outputs, nl_outputs, local_index, sample_align, total_code_tokens, total_comment_tokens):
         # 使用第二层最后的隐藏状态进行对齐
-        align_outputs_1 = nl_outputs[2][-2][local_index]
-        align_outputs_2 = code_outputs[2][-2][local_index]
-
-        # 获取最后一层的注意力分数
+        align_outputs_1 = nl_outputs[2][-1][local_index]
+        align_outputs_2 = code_outputs[2][-1][local_index]
+        
         code_last_layer_attention = code_outputs[3][-1]  # [batch, num_heads, seq_len, seq_len]
         nl_last_layer_attention = nl_outputs[3][-1]
-
+        
         # 获取所有头的平均注意力分数
         code_attention = code_last_layer_attention[local_index].mean(dim=0)  # [seq_len, seq_len]
         nl_attention = nl_last_layer_attention[local_index].mean(dim=0)
-
-        # Calculate sum of attention scores for CLS token (index 0)
-        code_cls_attention = code_attention[0]  # Get attention scores from CLS token
-        nl_cls_attention = nl_attention[0]      # Get attention scores from CLS token
-
-        lcs_pairs = sample_align
-        loss_align_code = self.build_contrastive_pairs_effecient(
-            align_outputs_1, 
-            align_outputs_2, 
-            lcs_pairs, 
-            total_code_tokens,
-            code_cls_attention,
-            nl_cls_attention
-        )
-        # 如果loss是nan就用一个很小的值代替
-        if torch.isnan(loss_align_code):
-            loss_align_code = torch.tensor(1e-8, device=loss_align_code.device)
+        
+        # code_cls_attention = code_attention[0]
+        # nl_cls_attention = nl_attention[0]
         
         # 计算attention loss的部分
         alignment_code_indices = set()
@@ -594,7 +655,7 @@ class Model(nn.Module):
         pair_token_counts = []
         pair_indices = []  # 存储每对的具体索引
 
-        for n, m in lcs_pairs:
+        for n, m in sample_align:
             code_indices = []
             nl_indices = []
             
@@ -620,8 +681,36 @@ class Model(nn.Module):
         # 转换为tensor并加1(因为CLS token)
         alignment_code_indices = torch.tensor([i + 1 for i in alignment_code_indices], device=code_inputs.device)
         alignment_nl_indices = torch.tensor([i + 1 for i in alignment_nl_indices], device=code_inputs.device)
+        
+        # Calculate thresholds for aligned and non-aligned tokens
+        code_aligned_threshold = 1.0 / len(alignment_code_indices)
+        nl_aligned_threshold = 1.0 / len(alignment_nl_indices)
+        code_other_threshold = 1.0 / total_code_tokens
+        nl_other_threshold = 1.0 / total_comment_tokens
 
-        epsilon = 1e-10
+        # 使用陡峭的sigmoid函数将attention scores转换为接近0/1的值
+        steepness = 50.0  # 控制sigmoid的陡峭程度
+        steepness_code = 50.0  # 控制sigmoid的陡峭程度
+        
+        # Create masks for aligned indices
+        code_aligned_mask = torch.zeros(len(code_attention[0]), dtype=torch.bool, device=code_inputs.device)
+        nl_aligned_mask = torch.zeros(len(nl_attention[0]), dtype=torch.bool, device=code_inputs.device)
+        code_aligned_mask[alignment_code_indices] = True
+        nl_aligned_mask[alignment_nl_indices] = True
+        
+        # Vectorized computation for code attention
+        code_thresholds = torch.where(code_aligned_mask, 
+                                    code_aligned_threshold, 
+                                    code_other_threshold)
+        code_cls_attention = torch.sigmoid(steepness_code * (code_attention[0] - code_thresholds))
+        
+        # Vectorized computation for nl attention  
+        nl_thresholds = torch.where(nl_aligned_mask,
+                                  nl_aligned_threshold,
+                                  nl_other_threshold)
+        nl_cls_attention = torch.sigmoid(steepness * (nl_attention[0] - nl_thresholds))
+
+        epsilon = 1e-7
 
         # 创建target attention分布 - 标注过的位置为1,其他位置为0
         code_target_attention = torch.zeros_like(code_cls_attention, device=code_inputs.device)
@@ -634,14 +723,50 @@ class Model(nn.Module):
             nl_target_attention[i] = 1.0
 
         # 裁剪避免数值不稳定
-        code_cls_attention = torch.clamp(code_cls_attention, min=epsilon, max=1.0-epsilon)
-        nl_cls_attention = torch.clamp(nl_cls_attention, min=epsilon, max=1.0-epsilon)
+        # code_cls_attention = torch.clamp(code_cls_attention, min=epsilon, max=1.0-epsilon)
+        # nl_cls_attention = torch.clamp(nl_cls_attention, min=epsilon, max=1.0-epsilon)
+        # Calculate average threshold for code
+        avg_code_threshold = (code_aligned_threshold + code_other_threshold) / 2
+        
+        # Create binary mask based on threshold comparison
+        code_threshold_mask = (code_attention[0] > avg_code_threshold).float()
+
+        # Calculate average threshold for nl
+        avg_nl_threshold = (nl_aligned_threshold + nl_other_threshold) / 2
+        
+        # Create binary mask based on threshold comparison for nl
+        nl_threshold_mask = (nl_attention[0] > avg_nl_threshold).float()
+        
+        # Get new CLS representations for code and nl
+        code_cls_new, code_cls_probs, code_cls_scores = self.cls_attention(
+            cls_token=align_outputs_2[0],  # Take CLS token
+            sequence_tokens=align_outputs_2, # Take sequence tokens
+            attention_mask=code_threshold_mask
+        )
+        
+        nl_cls_new, nl_cls_probs, nl_cls_scores = self.cls_attention(
+            cls_token=align_outputs_1[0],
+            sequence_tokens=align_outputs_1,
+            attention_mask=nl_threshold_mask
+        )
+        
+        print("Average code threshold:", avg_code_threshold)
+        print("Threshold comparison mask:", code_threshold_mask)
+        print(code_attention[0])
+        print(code_cls_attention)
+        print(code_target_attention)
 
         # 计算二元交叉熵损失
-        code_loss = -(code_target_attention * torch.log(code_cls_attention) + 
-                     (1 - code_target_attention) * torch.log(1 - code_cls_attention))
-        nl_loss = -(nl_target_attention * torch.log(nl_cls_attention) + 
-                   (1 - nl_target_attention) * torch.log(1 - nl_cls_attention))
+        code_loss = -(code_target_attention * torch.log(code_cls_attention + epsilon) + 
+                    (1 - code_target_attention) * torch.log(1 - code_cls_attention + epsilon))
+
+        nl_loss = -(nl_target_attention * torch.log(nl_cls_attention + epsilon) + 
+                    (1 - nl_target_attention) * torch.log(1 - nl_cls_attention + epsilon))
+        # code_loss = F.binary_cross_entropy_with_logits(code_cls_attention, code_target_attention)
+        # nl_loss = F.binary_cross_entropy_with_logits(nl_cls_attention, nl_target_attention)
+        print(code_loss)
+        # print(code_threshold)
+        # aaa
 
         code_loss = code_loss.mean()
         nl_loss = nl_loss.mean()
@@ -671,8 +796,185 @@ class Model(nn.Module):
                                attention_loss)
         else:
             attention_loss = torch.tensor(0.0).to(code_inputs.device)
+            
+        
+        lcs_pairs = sample_align
+        loss_align_code = self.build_contrastive_pairs_effecient(
+            align_outputs_1, 
+            align_outputs_2, 
+            lcs_pairs, 
+            total_code_tokens,
+            code_cls_attention,
+            nl_cls_attention
+        )
+        # 如果loss是nan就用一个很小的值代替
+        if torch.isnan(loss_align_code):
+            loss_align_code = torch.tensor(1e-8, device=loss_align_code.device)
+        
+        # attention_loss = code_loss + nl_loss
 
-        return loss_align_code, attention_loss
+        return loss_align_code, attention_loss, code_cls_new, nl_cls_new
+    
+    def batch_alignment_with_max_pair(self, code_inputs, code_outputs, nl_outputs, local_index, sample_align, total_code_tokens):
+        # Get embeddings and attention scores
+        align_outputs_1 = nl_outputs[2][-1][local_index]
+        align_outputs_2 = code_outputs[2][-1][local_index]
+        
+        code_last_layer_attention = code_outputs[3][-1]
+        nl_last_layer_attention = nl_outputs[3][-1]
+        
+        code_attention = code_last_layer_attention[local_index].mean(dim=0)
+        nl_attention = nl_last_layer_attention[local_index].mean(dim=0)
+        
+        code_cls_attention = code_attention[0]
+        nl_cls_attention = nl_attention[0]
+
+        # Calculate alignment loss and get max contributing pair
+        loss_align_code, max_pair = self.build_contrastive_pairs_with_contribution(
+            align_outputs_1,
+            align_outputs_2, 
+            sample_align,
+            total_code_tokens,
+            code_cls_attention,
+            nl_cls_attention
+        )
+
+        return loss_align_code, max_pair
+
+    def build_contrastive_pairs_with_contribution(self, align_outputs_1, align_outputs_2, lcs_pairs, total_code_tokens, code_attention_cls, nl_attention_cls):
+        total_loss = 0
+        max_contribution = float('-inf')
+        max_pair = None
+        temperature = 0.2
+        temperature_pos = 0.1
+
+        for pair in lcs_pairs:
+            # Get indices for current pair
+            comment_indices = []
+            for i in range(0, len(pair[0]), 2):
+                comment_indices.extend(range(pair[0][i] + 1, pair[0][i + 1] + 2))
+            
+            code_indices = []
+            for i in range(0, len(pair[1]), 2):
+                code_indices.extend(range(pair[1][i] + 1, pair[1][i + 1] + 2))
+
+            comment_indices = torch.tensor(comment_indices, device=align_outputs_1.device)
+            code_indices = torch.tensor(code_indices, device=align_outputs_2.device)
+            
+            comment_embeddings = align_outputs_1[comment_indices]
+            code_embeddings = align_outputs_2[code_indices]
+            
+            attention_weights = nl_attention_cls[comment_indices]
+            code_attention_weights = code_attention_cls[code_indices]
+            attention_coef = attention_weights.unsqueeze(1) * code_attention_weights.unsqueeze(0)
+            
+            # Calculate positive similarities
+            pos_similarities = F.cosine_similarity(
+                comment_embeddings.unsqueeze(1),
+                code_embeddings.unsqueeze(0),
+                dim=2
+            )
+
+            # Get negative samples
+            negative_indices = list(set(range(total_code_tokens)) - set(code_indices.tolist()))
+            if len(negative_indices) == 0:
+                continue
+                
+            negative_indices = torch.tensor(negative_indices, device=align_outputs_2.device)
+            negative_embeddings = align_outputs_2[negative_indices]
+            
+            raw_neg_similarities = F.cosine_similarity(
+                comment_embeddings.unsqueeze(1),
+                negative_embeddings.unsqueeze(0),
+                dim=2
+            )
+            
+            neg_similarities = 2 * torch.clamp(raw_neg_similarities, min=0) - 1
+            
+            pos_exp_sim = torch.exp(pos_similarities / temperature_pos)
+            neg_exp_sim = torch.exp(neg_similarities / temperature)
+            
+            neg_similarity_sum = neg_exp_sim.sum(dim=1)
+            
+            denominator = pos_exp_sim + neg_similarity_sum.unsqueeze(1) + 1e-8
+            nt_xent_loss = -torch.log(pos_exp_sim / denominator)
+            
+            attention_weight = 1.0 / (attention_coef + 1e-8)
+            weighted_loss = (nt_xent_loss * attention_weight).mean()
+            
+            neg_loss = torch.mean(torch.clamp(-raw_neg_similarities, min=0))
+            
+            pair_contribution = (weighted_loss + 0.2 * neg_loss)
+            total_loss += pair_contribution
+
+            # Track maximum contributing pair
+            if pair_contribution > max_contribution:
+                max_contribution = pair_contribution
+                # Store the first token indices of the pair
+                max_pair = (comment_indices[0].item()-1, code_indices[0].item()-1)
+
+        return total_loss, max_pair
+    
+    def get_new_cls_tokens(self, code_outputs, nl_outputs, local_index, total_code_tokens, total_comment_tokens):
+        # Get last layer hidden states and attention weights
+        align_outputs_1 = nl_outputs[2][-1][local_index]  # NL hidden states
+        align_outputs_2 = code_outputs[2][-1][local_index]  # Code hidden states
+        
+        code_last_layer_attention = code_outputs[3][-1]  # [batch, num_heads, seq_len, seq_len]
+        nl_last_layer_attention = nl_outputs[3][-1]
+        
+        # Get average attention scores across all heads
+        code_attention = code_last_layer_attention[local_index].mean(dim=0)  # [seq_len, seq_len]
+        nl_attention = nl_last_layer_attention[local_index].mean(dim=0)
+
+        # Calculate average thresholds
+        epsilon = 5e-3  # Small constant for numerical stability
+        code_threshold = 1.0 / total_code_tokens + epsilon
+        nl_threshold = 1.0 / total_comment_tokens + epsilon
+        
+        # Create binary masks based on threshold comparison
+        code_threshold_mask = (code_attention[0] > code_threshold).float()
+        nl_threshold_mask = (nl_attention[0] > nl_threshold).float()
+        
+        # Get new CLS representations using attention layer
+        code_cls_new, code_cls_probs, code_cls_scores = self.cls_attention(
+            cls_token=align_outputs_2[0],  # Take CLS token
+            sequence_tokens=align_outputs_2,  # Take sequence tokens
+            attention_mask=code_threshold_mask
+        )
+        
+        nl_cls_new, nl_cls_probs, nl_cls_scores = self.cls_attention(
+            cls_token=align_outputs_1[0],
+            sequence_tokens=align_outputs_1,
+            attention_mask=nl_threshold_mask
+        )
+        
+        return code_cls_new, nl_cls_new
+    
+    def get_new_cls_tokens_for_code_or_nl(self, code_outputs, local_index, total_code_tokens):
+        # Get last layer hidden states and attention weights
+        align_outputs_2 = code_outputs[2][-1][local_index]  # Code hidden states
+        
+        code_last_layer_attention = code_outputs[3][-1]  # [batch, num_heads, seq_len, seq_len]
+
+        # Get average attention scores across all heads
+        code_attention = code_last_layer_attention[local_index].mean(dim=0)  # [seq_len, seq_len]
+
+        # Calculate average thresholds
+        epsilon = 5e-3  # Small constant for numerical stability
+        code_threshold = 1.0 / total_code_tokens + epsilon
+        
+        # Create binary masks based on threshold comparison
+        code_threshold_mask = (code_attention[0] > code_threshold).float()
+        
+        # Get new CLS representations using attention layer
+        code_cls_new, code_cls_probs, code_cls_scores = self.cls_attention(
+            cls_token=align_outputs_2[0],  # Take CLS token
+            sequence_tokens=align_outputs_2,  # Take sequence tokens
+            attention_mask=code_threshold_mask
+        )
+        
+        return code_cls_new
     
     def build_contrastive_pairs_effecient(self, align_outputs_1, align_outputs_2, lcs_pairs, total_code_tokens, code_attention_cls, nl_attention_cls):
         loss_align_code = 0
@@ -737,12 +1039,15 @@ class Model(nn.Module):
             denominator = pos_exp_sim + neg_similarity_sum.unsqueeze(1) + 1e-8
             # 对每个正样本对分别计算损失并乘以对应的attention权重
             nt_xent_loss = -torch.log(pos_exp_sim / denominator)
-            nt_xent_loss = nt_xent_loss.mean()
-            # print(attention_coef)
+            
+            # 使用attention_coef的倒数作为权重，当attention乘积低时增大loss
+            attention_weight = 1.0 / (attention_coef + 1e-8)  # 加上小值避免除0
+            weighted_loss = (nt_xent_loss * attention_weight).mean()
+            
             # 添加负样本损失
             neg_loss = torch.mean(torch.clamp(-raw_neg_similarities, min=0))
             
-            loss_align_code += (nt_xent_loss + 0.2 * neg_loss)
+            loss_align_code += (weighted_loss + 0.2 * neg_loss)
             num_pair += 1
 
         return loss_align_code

@@ -1942,9 +1942,6 @@ def train_alignment_auto_labeled_samples(args, model, tokenizer,pool):
             idx_list.append(json_obj['idx'])
             match_list.append(json_obj['match'])
 
-    # idx_list = idx_list[:1]
-    # match_list = match_list[:1]
-
     # Get full training dataset
     full_dataset = TextDataset(tokenizer, args, args.train_data_file, pool)
     
@@ -1996,12 +1993,45 @@ def train_alignment_auto_labeled_samples(args, model, tokenizer,pool):
     accumulation_steps = 8  # 设置为8,这样每个epoch会更新大约20-25次参数,可以在训练稳定性和效率之间取得平衡
     optimizer.zero_grad()
 
+    # 设定开始加入retrieval loss的轮次
+    retrieval_start_epoch = 3
+
     for idx in range(start_epoch, args.num_train_epochs):
         total_epoch_align_loss = 0
         total_epoch_attention_loss = 0 
         total_epoch_retrieval_loss = 0
         total_batches = 0
-
+        # 当开始retrieval loss后冻结encoder参数并调整学习率
+        if idx >= retrieval_start_epoch:
+            # 冻结encoder参数并从optimizer中移除
+            if isinstance(model, torch.nn.DataParallel):
+                for param in model.module.encoder.parameters():
+                    param.requires_grad = False
+                    # 清除encoder部分的梯度
+                    if param.grad is not None:
+                        param.grad.zero_()
+                        param.grad = None
+                # 重建optimizer,只包含未冻结的参数
+                optimizer = AdamW([p for n, p in model.module.named_parameters() if 'encoder' not in n and p.requires_grad], 
+                                lr=args.learning_rate, eps=1e-8)
+            else:
+                for param in model.encoder.parameters():
+                    param.requires_grad = False
+                    # 清除encoder部分的梯度
+                    if param.grad is not None:
+                        param.grad.zero_()
+                        param.grad = None
+                # 重建optimizer,只包含未冻结的参数
+                optimizer = AdamW([p for n, p in model.named_parameters() if 'encoder' not in n and p.requires_grad],
+                                lr=args.learning_rate, eps=1e-8)
+            
+            # 计算学习率衰减因子
+            decay_factor = 0.95 ** (idx - retrieval_start_epoch)
+            
+            # 调整学习率 - 先增大后逐渐衰减
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = args.learning_rate * 5.0 * decay_factor  # 初始增大5倍后逐步衰减
+        
         for step, batch in enumerate(train_dataloader):
             total_batches += 1
             
@@ -2015,13 +2045,11 @@ def train_alignment_auto_labeled_samples(args, model, tokenizer,pool):
             code_outputs = model(code_inputs=code_inputs,attn_mask=attn_mask,position_idx=position_idx)
             nl_outputs = model(nl_inputs=nl_inputs)
             
-            # code_vec = code_outputs[1]
-            # nl_vec = nl_outputs[1]
-
-            # scores = torch.einsum("ab,cb->ac",nl_vec,code_vec)
-            # loss_fct = CrossEntropyLoss()
-            # retrieval_loss = loss_fct(scores, torch.arange(code_inputs.size(0), device=scores.device))
-            # total_epoch_retrieval_loss += retrieval_loss.item()
+            # 初始化存储所有样本的new cls tokens的tensor
+            batch_size = code_inputs.size(0)
+            hidden_size = code_outputs[0].size(-1)
+            code_cls_new_batch = torch.zeros(batch_size, hidden_size).to(args.device)
+            nl_cls_new_batch = torch.zeros(batch_size, hidden_size).to(args.device)
 
             total_align_loss = 0
             total_attention_loss = 0
@@ -2033,36 +2061,72 @@ def train_alignment_auto_labeled_samples(args, model, tokenizer,pool):
                     break
                     
                 total_code_tokens = min(ori2cur_pos[batch_idx].max().item(), 255)
+                # Get total tokens for code and comment
+                code_tokens_2 = (code_inputs[batch_idx] == 2).nonzero().flatten()
+                nl_tokens_2 = (nl_inputs[batch_idx] == 2).nonzero().flatten()
+                
+                # Set default values if no token 2 found
+                if len(code_tokens_2) == 0:
+                    total_code_tokens = 255 - 1
+                else:
+                    total_code_tokens = int(code_tokens_2[0].item() - 1)
+                    
+                if len(nl_tokens_2) == 0:
+                    total_comment_tokens = 127 - 1
+                else:
+                    total_comment_tokens = int(nl_tokens_2[0].item() - 1)
 
                 if isinstance(model, torch.nn.DataParallel):
-                    align_loss, attention_loss = model.module.batch_alignment(
-                        code_inputs, code_outputs, nl_outputs, batch_idx, match_list[sample_idx], total_code_tokens
+                    align_loss, attention_loss, code_cls_new, nl_cls_new = model.module.batch_alignment(
+                        code_inputs, code_outputs, nl_outputs, batch_idx, match_list[sample_idx], total_code_tokens, total_comment_tokens
                     )
                 else:
-                    align_loss, attention_loss = model.batch_alignment(
-                        code_inputs, code_outputs, nl_outputs, batch_idx, match_list[sample_idx], total_code_tokens
+                    align_loss, attention_loss, code_cls_new, nl_cls_new = model.batch_alignment(
+                        code_inputs, code_outputs, nl_outputs, batch_idx, match_list[sample_idx], total_code_tokens, total_comment_tokens
                     )
 
                 total_align_loss += align_loss
                 total_attention_loss += attention_loss
 
-            # aa_loss = total_align_loss + total_attention_loss + retrieval_loss
-            aa_loss = 3*total_align_loss + total_attention_loss
-            aa_loss.backward()
+                # 将每个样本的new cls token存入batch tensor中
+                code_cls_new_batch[batch_idx] = code_cls_new
+                nl_cls_new_batch[batch_idx] = nl_cls_new
+
+            # 计算retrieval loss (在指定轮次后启用)
+            if idx >= retrieval_start_epoch:
+                scores = torch.einsum("ab,cb->ac",nl_cls_new_batch,code_cls_new_batch)
+                temperature = 0.01  # 试试更小的温度
+                scores = scores / temperature
+                # print("scores min:", scores.min().item(), "scores max:", scores.max().item())
+                loss_fct = CrossEntropyLoss()
+                retrieval_loss = loss_fct(scores, torch.arange(code_inputs.size(0), device=scores.device))
+                total_epoch_retrieval_loss += retrieval_loss.item()
+                # 只使用retrieval loss进行反向传播
+                retrieval_loss.backward()
+            else:
+                # 使用原来的loss组合
+                aa_loss = 3*total_align_loss + total_attention_loss
+                aa_loss.backward()
             
             total_epoch_align_loss += total_align_loss.item()
             total_epoch_attention_loss += total_attention_loss.item()
             
-            logger.info(
-                "epoch {} step {} accumulated align loss {} attention loss {}".format(
-                    idx, step + 1,
-                    round(total_align_loss.item(), 5),
-                    round(total_attention_loss.item(), 5)
+            if idx >= retrieval_start_epoch:
+                logger.info(
+                    "epoch {} step {} retrieval loss {}".format(
+                        idx, step + 1,
+                        round(retrieval_loss.item(), 5)
+                    )
                 )
-            )
+            else:
+                logger.info(
+                    "epoch {} step {} accumulated align loss {} attention loss {}".format(
+                        idx, step + 1,
+                        round(total_align_loss.item(), 5),
+                        round(total_attention_loss.item(), 5)
+                    )
+                )
 
-            # Handle gradient accumulation and optimization
-            # if (step + 1) % accumulation_steps == 0 or (step + 1) == len(train_dataloader):
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             optimizer.step()
             optimizer.zero_grad()
@@ -2071,14 +2135,17 @@ def train_alignment_auto_labeled_samples(args, model, tokenizer,pool):
         # Calculate average losses for the epoch
         avg_align_loss = total_epoch_align_loss / total_batches
         avg_attention_loss = total_epoch_attention_loss / total_batches
-        # avg_retrieval_loss = total_epoch_retrieval_loss / total_batches
+        avg_retrieval_loss = total_epoch_retrieval_loss / total_batches if idx >= retrieval_start_epoch else 0
 
-        logger.info("Epoch {} average losses - Align Loss: {:.5f}, Attention Loss: {:.5f}".format(
-            idx + 1, avg_align_loss, avg_attention_loss
-        ))
+        if idx >= retrieval_start_epoch:
+            logger.info("Epoch {} average losses - Retrieval Loss: {:.5f}".format(
+                idx + 1, avg_retrieval_loss
+            ))
+        else:
+            logger.info("Epoch {} average losses - Align Loss: {:.5f}, Attention Loss: {:.5f}".format(
+                idx + 1, avg_align_loss, avg_attention_loss
+            ))
 
-        # Evaluate every n epochs
-        # if (idx + 1) % 5 == 0:
         results = evaluate(args, model, tokenizer,args.eval_data_file, pool, eval_when_training=True)
         for key, value in results.items():
             logger.info("  %s = %s", key, round(value,4))    
@@ -2088,11 +2155,220 @@ def train_alignment_auto_labeled_samples(args, model, tokenizer,pool):
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
         model_to_save = model.module if hasattr(model, 'module') else model
-        ckpt_output_path = os.path.join(output_dir, 'subject_model_only_multiple_aa_labeled_simple_67k_alignment.pth')
+        ckpt_output_path = os.path.join(output_dir, 'subject_model_only_multiple_aa_labeled_test.pth')
         logger.info("Saving model checkpoint to %s", ckpt_output_path)
         torch.save(model_to_save.state_dict(), ckpt_output_path)
 
         print("Model saved.")
+
+def save_labeled_samples_cls_tokens(args, model, tokenizer, pool):
+    """ Save new CLS tokens for labeled samples across epochs """
+    # Load sample indices from file
+    input_path = "/inspire/hdd/ws-f4d69b29-e0a5-44e6-bd92-acf4de9990f0/public-project/liuyiming-240108540153/codesearch/auto_labelling/sorted_labelling_sample_api_student_conf_sorted_2.jsonl"
+    idx_list = []
+    match_list = []
+
+    with open(input_path, 'r', encoding='utf-8') as file:
+        for line in file:
+            line = line.strip().rstrip(',')
+            json_obj = json.loads(line)
+            idx_list.append(json_obj['idx'])
+            match_list.append(json_obj['match'])
+
+    # Get training dataset
+    train_dataset = TextDataset(tokenizer, args, args.train_data_file, pool)
+    
+    # Multi-gpu setup
+    if args.n_gpu > 1:
+        model = torch.nn.DataParallel(model)
+
+    # Track features across epochs 1-20
+    for epoch in range(1, 21):
+        # Load model checkpoint for current epoch
+        output_dir = os.path.join(args.output_dir, f'Epoch_{epoch}')
+        ckpt_output_path = os.path.join(output_dir, 'subject_model_only_multiple_aa_labeled_test.pth')
+        
+        # Create output directory for features
+        features_output_dir = os.path.join("/inspire/hdd/ws-f4d69b29-e0a5-44e6-bd92-acf4de9990f0/public-project/liuyiming-240108540153/training_dynamic/features/only_aa_labeled_multi_epochs_new_cls", f'Epoch_{epoch}')
+        os.makedirs(features_output_dir, exist_ok=True)
+
+        # Load model state
+        model.load_state_dict(torch.load(ckpt_output_path), strict=False)
+        model.to(args.device)
+        model.eval()
+
+        # Create subset of labeled samples
+        labeled_indices = torch.tensor(idx_list)
+        labeled_dataset = torch.utils.data.Subset(train_dataset, labeled_indices)
+        labeled_dataloader = DataLoader(labeled_dataset, batch_size=args.train_batch_size,
+                                      shuffle=False, num_workers=4)
+
+        nl_cls_tokens = []
+        code_cls_tokens = []
+
+        # Process all batches
+        with torch.no_grad():
+            for step, batch in enumerate(labeled_dataloader):
+                code_inputs = batch[0].to(args.device)
+                attn_mask = batch[1].to(args.device)
+                position_idx = batch[2].to(args.device)
+                nl_inputs = batch[3].to(args.device)
+                ori2cur_pos = batch[4].to(args.device)
+
+                code_outputs = model(code_inputs=code_inputs, attn_mask=attn_mask, position_idx=position_idx)
+                nl_outputs = model(nl_inputs=nl_inputs)
+
+                # Process each sample in batch
+                for batch_idx in range(code_inputs.size(0)):
+                    sample_idx = step * args.train_batch_size + batch_idx
+                    if sample_idx >= len(match_list):
+                        break
+
+                    # Get total tokens
+                    code_tokens_2 = (code_inputs[batch_idx] == 2).nonzero().flatten()
+                    nl_tokens_2 = (nl_inputs[batch_idx] == 2).nonzero().flatten()
+
+                    total_code_tokens = 255 - 1 if len(code_tokens_2) == 0 else int(code_tokens_2[0].item() - 1)
+                    total_comment_tokens = 127 - 1 if len(nl_tokens_2) == 0 else int(nl_tokens_2[0].item() - 1)
+
+                    # Get new CLS tokens
+                    if isinstance(model, torch.nn.DataParallel):
+                        code_cls_new, nl_cls_new = model.module.get_new_cls_tokens(
+                            code_outputs, nl_outputs, batch_idx, 
+                            total_code_tokens, total_comment_tokens
+                        )
+                    else:
+                        code_cls_new, nl_cls_new = model.get_new_cls_tokens(
+                            code_outputs, nl_outputs, batch_idx, 
+                            total_code_tokens, total_comment_tokens
+                        )
+
+                    code_cls_tokens.append(code_cls_new.cpu().numpy())
+                    nl_cls_tokens.append(nl_cls_new.cpu().numpy())
+
+                if (step + 1) % 100 == 0:
+                    logger.info(f"Processed {step + 1} batches")
+
+            # Save concatenated features
+            nl_cls_tokens = np.array(nl_cls_tokens)
+            code_cls_tokens = np.array(code_cls_tokens)
+            print(nl_cls_tokens.shape)
+            print(code_cls_tokens.shape)
+
+            np.save(os.path.join(features_output_dir, 'train_nl_cls_tokens.npy'), nl_cls_tokens)
+            np.save(os.path.join(features_output_dir, 'train_code_cls_tokens.npy'), code_cls_tokens)
+
+            print(f"Saved features for epoch {epoch}")
+
+        # Clear GPU memory
+        torch.cuda.empty_cache()
+
+def save_labeled_sample_cl_valid(args, model, tokenizer, pool):
+    """ Save features for all validation samples across all epochs """
+    # Get validation datasets
+    valid_nl_dataset = TextDataset(tokenizer, args, args.eval_data_file, pool)
+    valid_code_dataset = TextDataset(tokenizer, args, args.codebase_file, pool)
+    
+    valid_nl_dataloader = DataLoader(valid_nl_dataset, batch_size=args.train_batch_size, 
+                                   shuffle=False, num_workers=4)
+    valid_code_dataloader = DataLoader(valid_code_dataset, batch_size=args.train_batch_size,
+                                     shuffle=False, num_workers=4)
+
+    # Multi-gpu setup
+    if args.n_gpu > 1:
+        model = torch.nn.DataParallel(model)
+
+    # Track features across epochs
+    for epoch in range(5, 6):
+        # Load model checkpoint for current epoch
+        output_dir = os.path.join(args.output_dir, f'Epoch_{epoch}')
+        ckpt_output_path = os.path.join(output_dir, 'subject_model_labeled_retrieval_only_2.pth')
+        
+        # Create output directory for features
+        features_output_dir = os.path.join("/inspire/hdd/ws-f4d69b29-e0a5-44e6-bd92-acf4de9990f0/public-project/liuyiming-240108540153/training_dynamic/features/only_aa_labeled_multi_epochs_cls_valid", f'Epoch_{epoch}')
+        os.makedirs(features_output_dir, exist_ok=True)
+        
+        # Load model state
+        model.load_state_dict(torch.load(ckpt_output_path), strict=False)
+        model.to(args.device)
+        model.eval()
+
+        # Process NL features first
+        nl_cls_tokens = []
+        with torch.no_grad():
+            for step, batch in enumerate(valid_nl_dataloader):
+                nl_inputs = batch[3].to(args.device)
+                nl_outputs = model(nl_inputs=nl_inputs)
+
+                for batch_idx in range(nl_inputs.size(0)):
+                    nl_tokens_2 = (nl_inputs[batch_idx] == 2).nonzero().flatten()
+                    total_comment_tokens = 127 - 1 if len(nl_tokens_2) == 0 else int(nl_tokens_2[0].item() - 1)
+
+                    if isinstance(model, torch.nn.DataParallel):
+                        nl_cls_new = model.module.get_new_cls_tokens_for_code_or_nl(
+                            nl_outputs, batch_idx,
+                            total_comment_tokens
+                        )
+                    else:
+                        nl_cls_new = model.get_new_cls_tokens_for_code_or_nl(
+                            nl_outputs, batch_idx,
+                            total_comment_tokens
+                        )
+
+                    nl_cls_tokens.append(nl_cls_new.cpu().numpy())
+
+                if (step + 1) % 100 == 0:
+                    logger.info(f"Processed {step + 1} NL batches")
+
+            # Save NL features
+            nl_cls_tokens = np.array(nl_cls_tokens)
+            print(f"NL features shape: {nl_cls_tokens.shape}")
+            np.save(os.path.join(features_output_dir, 'valid_nl_cls_tokens.npy'), nl_cls_tokens)
+            del nl_cls_tokens
+            print(f"Saved NL validation features for epoch {epoch}")
+
+        # Clear GPU memory
+        torch.cuda.empty_cache()
+
+        # Process code features
+        code_cls_tokens = []
+        with torch.no_grad():
+            for step, batch in enumerate(valid_code_dataloader):
+                code_inputs = batch[0].to(args.device)
+                attn_mask = batch[1].to(args.device)
+                position_idx = batch[2].to(args.device)
+                code_outputs = model(code_inputs=code_inputs, attn_mask=attn_mask, position_idx=position_idx)
+
+                for batch_idx in range(code_inputs.size(0)):
+                    code_tokens_2 = (code_inputs[batch_idx] == 2).nonzero().flatten()
+                    total_code_tokens = 255 - 1 if len(code_tokens_2) == 0 else int(code_tokens_2[0].item() - 1)
+
+                    if isinstance(model, torch.nn.DataParallel):
+                        code_cls_new = model.module.get_new_cls_tokens_for_code_or_nl(
+                            code_outputs, batch_idx,
+                            total_code_tokens
+                        )
+                    else:
+                        code_cls_new = model.get_new_cls_tokens_for_code_or_nl(
+                            code_outputs, batch_idx,
+                            total_code_tokens
+                        )
+
+                    code_cls_tokens.append(code_cls_new.cpu().numpy())
+
+                if (step + 1) % 100 == 0:
+                    logger.info(f"Processed {step + 1} code batches")
+
+            # Save code features
+            code_cls_tokens = np.array(code_cls_tokens)
+            print(f"Code features shape: {code_cls_tokens.shape}")
+            np.save(os.path.join(features_output_dir, 'valid_code_cls_tokens.npy'), code_cls_tokens)
+            del code_cls_tokens
+            print(f"Saved code validation features for epoch {epoch}")
+
+        # Clear GPU memory
+        torch.cuda.empty_cache()
+
 
 
 def train_alignment_single_sample(args, model, tokenizer,pool):

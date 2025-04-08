@@ -329,33 +329,27 @@ def slicing(args, model, tokenizer, pool):
     train_sampler = SequentialSampler(labeled_samples)
     train_dataloader = DataLoader(labeled_samples, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=4)
 
-    # Get validation datasets
-    valid_nl_dataset = TextDataset(tokenizer, args, args.eval_data_file, pool)
-    valid_code_dataset = TextDataset(tokenizer, args, args.codebase_file, pool)
     
-    valid_nl_sampler = SequentialSampler(valid_nl_dataset)
-    valid_code_sampler = SequentialSampler(valid_code_dataset)
+    full_sampler = SequentialSampler(full_dataset)
+    full_dataloader = DataLoader(full_dataset, sampler=full_sampler, batch_size=args.train_batch_size, num_workers=4)
     
-    valid_nl_dataloader = DataLoader(valid_nl_dataset, sampler=valid_nl_sampler, batch_size=args.train_batch_size, num_workers=4)
-    valid_code_dataloader = DataLoader(valid_code_dataset, sampler=valid_code_sampler, batch_size=args.train_batch_size, num_workers=4)
-    
-    # First pass: Extract embeddings for specific indices of valid code and NL samples
-    valid_nl_idx = 11637  # Example valid NL sample index
-    specific_nl_idx = 8
-    valid_code_idx = 18268  # Example valid code sample index
-    specific_code_idx = 8
-    valid_found = False
+    # First pass: Extract embeddings for specific indices
+    target_idx = 11637  # Example target sample index
+    specific_nl_idx = 8  # Specific token index for NL
+    specific_code_idx = 8  # Specific token index for code
+    target_found = False
 
     ckpt_output_path = os.path.join(args.output_dir, 'Epoch_20', 'subject_model_only_multiple_aa_labeled_simple_10k_2.pth')
     model.load_state_dict(torch.load(ckpt_output_path), strict=False)
     model.to(args.device)
     model.eval()
 
-    # Extract embeddings for valid NL sample
-    for batch_idx, batch in enumerate(valid_nl_dataloader):
-        if batch_idx * args.train_batch_size <= valid_nl_idx < (batch_idx + 1) * args.train_batch_size:
-            local_idx = valid_nl_idx - batch_idx * args.train_batch_size
+    # Extract embeddings for both code and NL from the same batch
+    for batch_idx, batch in enumerate(full_dataloader):
+        if batch_idx * args.train_batch_size <= target_idx < (batch_idx + 1) * args.train_batch_size:
+            local_idx = target_idx - batch_idx * args.train_batch_size
             
+            # Get NL embeddings
             nl_inputs = batch[3].to(args.device)
             nl_outputs = model(nl_inputs=nl_inputs)
             
@@ -366,15 +360,9 @@ def slicing(args, model, tokenizer, pool):
             print(nl_token_output.shape)
 
             nl_tokens = tokenizer.convert_ids_to_tokens(nl_inputs[local_idx].cpu().tolist()) 
-            print(f"{nl_tokens[specific_nl_idx]}")
-            valid_found = True
-            break
+            print(f"NL token: {nl_tokens[specific_nl_idx]}")
 
-    # Extract embeddings for valid code sample
-    for batch_idx, batch in enumerate(valid_code_dataloader):
-        if batch_idx * args.train_batch_size <= valid_code_idx < (batch_idx + 1) * args.train_batch_size:
-            local_idx = valid_code_idx - batch_idx * args.train_batch_size
-            
+            # Get code embeddings from the same batch
             code_inputs = batch[0].to(args.device)
             attn_mask = batch[1].to(args.device)
             position_idx = batch[2].to(args.device)
@@ -387,8 +375,9 @@ def slicing(args, model, tokenizer, pool):
             print(code_token_output.shape)
 
             code_tokens = tokenizer.convert_ids_to_tokens(code_inputs[local_idx].cpu().tolist()) 
-            print(f"{code_tokens[specific_code_idx]}")
-            valid_found = True
+            print(f"Code token: {code_tokens[specific_code_idx]}")
+            
+            target_found = True
             break
 
     # Record start time
@@ -416,7 +405,7 @@ def slicing(args, model, tokenizer, pool):
     end_time = time.time()
     print(f"Time taken for parameter updates: {end_time - start_time:.2f} seconds")
             
-    if not valid_found:
+    if not target_found:
         logger.warning("Target sample not found")
         return None
         
@@ -442,12 +431,10 @@ def slicing(args, model, tokenizer, pool):
         # Get embeddings from both models
         with torch.no_grad():
             # Original model embeddings
-            # model.load_state_dict(model_orig_state)
             code_outputs_orig = model(code_inputs=code_inputs, attn_mask=attn_mask, position_idx=position_idx)
             nl_outputs_orig = model(nl_inputs=nl_inputs)
             
             # Updated model embeddings
-            # model.load_state_dict(model_new.state_dict())
             code_outputs_new = model_new(code_inputs=code_inputs, attn_mask=attn_mask, position_idx=position_idx)
             nl_outputs_new = model_new(nl_inputs=nl_inputs)
         
@@ -465,18 +452,40 @@ def slicing(args, model, tokenizer, pool):
             # Get pairs for current sample if they exist
             if global_sample_idx < len(match_list):
                 pairs_list = match_list[global_sample_idx]
-                            
-                # Calculate losses incorporating attention and alignment loss
-                align_loss_orig, attention_loss_orig = model.batch_alignment(code_inputs=code_inputs, code_outputs=code_outputs_orig, nl_outputs=nl_outputs_orig, local_index=local_idx, sample_align=pairs_list, total_code_tokens=total_code_tokens)
-                align_loss_new, attention_loss_new = model_new.batch_alignment(code_inputs=code_inputs, code_outputs=code_outputs_new, nl_outputs=nl_outputs_new, local_index=local_idx, sample_align=pairs_list, total_code_tokens=total_code_tokens)
-                loss_orig = align_loss_orig + attention_loss_orig
-                loss_new = align_loss_new + attention_loss_new
+                
+                # Calculate alignment losses and get max alignment pair
+                align_loss_orig, max_align_pair_orig = model.batch_alignment_with_max_pair(
+                    code_inputs=code_inputs,
+                    code_outputs=code_outputs_orig,
+                    nl_outputs=nl_outputs_orig,
+                    local_index=local_idx,
+                    sample_align=pairs_list,
+                    total_code_tokens=total_code_tokens
+                )
+                
+                align_loss_new, max_align_pair_new = model_new.batch_alignment_with_max_pair(
+                    code_inputs=code_inputs,
+                    code_outputs=code_outputs_new,
+                    nl_outputs=nl_outputs_new,
+                    local_index=local_idx,
+                    sample_align=pairs_list,
+                    total_code_tokens=total_code_tokens
+                )
+                
                 # Calculate loss change
-                loss_change = loss_new.item() - loss_orig.item()
+                loss_change = align_loss_new.item() - align_loss_orig.item()
+                
+                # Get tokens for max alignment pairs
+                nl_token_orig = nl_tokens[max_align_pair_orig[0]]
+                code_token_orig = code_tokens[max_align_pair_orig[1]]
+                nl_token_new = nl_tokens[max_align_pair_new[0]]
+                code_token_new = code_tokens[max_align_pair_new[1]]
                 
                 pair_loss_changes.append({
                     'sample_idx': global_sample_idx,
                     'loss_change': loss_change,
+                    'max_align_orig': (nl_token_orig, code_token_orig),
+                    'max_align_new': (nl_token_new, code_token_new)
                 })
 
     # Sort pairs by loss change to get both most negative and most positive values
@@ -488,7 +497,9 @@ def slicing(args, model, tokenizer, pool):
         print(f"\nSample {i+1}:")
         print(f"Sample index: {change['sample_idx']}")
         print(f"Loss change: {change['loss_change']:.4f}")
-        print(f"sample: {train_dataset[idx_list[change['sample_idx']]]['code']}")
+        print(f"Original max alignment: NL token '{change['max_align_orig'][0]}' -> Code token '{change['max_align_orig'][1]}'")
+        print(f"New max alignment: NL token '{change['max_align_new'][0]}' -> Code token '{change['max_align_new'][1]}'")
+        print(f"Sample code: {train_dataset[idx_list[change['sample_idx']]]['code']}")
     
     # Print information for samples with the largest loss increases
     print("\nTop 3 samples with largest loss increases:")
@@ -496,10 +507,13 @@ def slicing(args, model, tokenizer, pool):
         print(f"\nSample {len(pair_loss_changes)-3+i+1}:")
         print(f"Sample index: {change['sample_idx']}")
         print(f"Loss change: {change['loss_change']:.4f}")
-        print(f"sample: {train_dataset[idx_list[change['sample_idx']]]['code']}")
+        print(f"Original max alignment: NL token '{change['max_align_orig'][0]}' -> Code token '{change['max_align_orig'][1]}'")
+        print(f"New max alignment: NL token '{change['max_align_new'][0]}' -> Code token '{change['max_align_new'][1]}'")
+        print(f"Sample code: {train_dataset[idx_list[change['sample_idx']]]['code']}")
     
     negative_loss_count = sum(1 for change in pair_loss_changes if change['loss_change'] < 0)
     positive_loss_count = sum(1 for change in pair_loss_changes if change['loss_change'] > 0)
+    print(f"\nSummary Statistics:")
     print(f"Total pairs: {len(pair_loss_changes)}")
     print(f"Negative loss pairs: {negative_loss_count}")
     print(f"Positive loss pairs: {positive_loss_count}")
