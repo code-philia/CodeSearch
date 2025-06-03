@@ -166,6 +166,6 @@ python auto_labelliny.py
 | RQ | Question | Evaluation Method | Metrics | Dataset |
 |:--|:---------|:-----------------|:--------|:--------|
 | RQ1 | Overall Retrieval Performance | Compare with baselines | MRR | ID: CodeSearchNet: Python, PHP, Go, Java, JavaScript, Ruby<br>OOD: COSQA+ |
-| RQ2 | Alignment & Attention Accuracy | Compare with baselines | Alignment Precision & Recall, Attention Precision & Recall, Retrieval Specific Recall | CodeSearchNet: Python, PHP, Go, Java, JavaScript |
-| RQ3 | Component Contribution | Remove components | MRR, R@1 | CodeSearchNet: Python, PHP, Go, Java, JavaScript |
+| RQ2 | Alignment & Attention Accuracy | Compare with baselines | Alignment Precision & Recall, Attention Precision & Recall, Retrieval Specific Recall | CodeSearchNet: Python, PHP, Go, Java, JavaScript, Ruby |
+| RQ3 | Component Contribution | Remove components | MRR | CodeSearchNet: Python, PHP, Go, Java, JavaScript, Ruby |
 | RQ4 | User Acceptance | User study | Acceptance Rate, Time Saved | 10-20 samples |
